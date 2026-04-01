@@ -1,0 +1,41 @@
+{
+  "devDependencies": {
+    "eslint": "^10.1.0",
+    "husky": "^9.1.7",
+    "jest": "^30.3.0",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.1",
+    "ts-jest": "^29.4.6",
+    "typescript": "^6.0.2"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/services/**/*.ts",
+      "src/controllers/**/*.ts",
+      "src/utils/**/*.ts"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "lines": 60,
+        "functions": 60
+      }
+    }
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{js,json,md}": [
+      "prettier --write"
+    ]
+  }
+}
