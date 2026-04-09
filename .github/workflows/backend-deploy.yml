@@ -1,0 +1,167 @@
+# CI/CD: lint, typecheck, tests + imagen Docker → ECR → ECS (force new deployment)
+# Requiere secrets de AWS/ECR/ECS configurados en el repositorio.
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  ci:
+    name: CI (lint, types, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Lint
+        run: |
+          set -euo pipefail
+          npm run lint
+
+      - name: Type check
+        run: |
+          set -euo pipefail
+          npx tsc --noEmit
+
+      - name: Tests with coverage
+        run: |
+          set -euo pipefail
+          npm run test:coverage
+
+      - name: Enforce coverage threshold (60%)
+        run: |
+          set -euo pipefail
+          if [[ ! -f coverage/coverage-summary.json ]]; then
+            echo "::error::coverage/coverage-summary.json not found"
+            exit 1
+          fi
+          COVERAGE=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)
+          echo "Lines coverage: ${COVERAGE}%"
+          if awk "BEGIN { exit !(${COVERAGE} < 60) }"; then
+            echo "::error::Coverage ${COVERAGE}% is below 60% threshold"
+            exit 1
+          fi
+
+  deploy:
+    name: CD (Docker → ECR → ECS)
+    needs: ci
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY ECR_REPOSITORY_URI ECS_CLUSTER ECS_SERVICE; do
+            if [[ -z "${!var:-}" ]]; then
+              missing+=("$var")
+            fi
+          done
+          if [[ ${#missing[@]} -ne 0 ]]; then
+            echo "::error::Faltan secrets en el repositorio: ${missing[*]}"
+            exit 1
+          fi
+          echo "Secrets requeridos presentes (valores no mostrados)."
+
+      - name: Resolve AWS region from ECR repository URI
+        id: ecr_meta
+        env:
+          URI: ${{ secrets.ECR_REPOSITORY_URI }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${URI}" =~ ^[0-9]+\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/.+ ]]; then
+            echo "::error::ECR_REPOSITORY_URI con formato inesperado."
+            echo "Esperado: <account>.dkr.ecr.<region>.amazonaws.com/<nombre-repo>"
+            exit 1
+          fi
+          REGION="${BASH_REMATCH[1]}"
+          echo "region=${REGION}" >> "${GITHUB_OUTPUT}"
+          echo "Región resuelta desde ECR: ${REGION}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.ecr_meta.outputs.region }}
+
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image
+        id: image
+        env:
+          ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Building image ${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+          docker build -t "${ECR_REPOSITORY_URI}:${IMAGE_TAG}" .
+          docker tag "${ECR_REPOSITORY_URI}:${IMAGE_TAG}" "${ECR_REPOSITORY_URI}:latest"
+          echo "Pushing tags: ${IMAGE_TAG}, latest"
+          docker push "${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+          docker push "${ECR_REPOSITORY_URI}:latest"
+          {
+            echo "repository_uri=${ECR_REPOSITORY_URI}"
+            echo "tag_sha=${IMAGE_TAG}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Imagen publicada correctamente."
+
+      - name: Deploy to Amazon ECS
+        env:
+          AWS_REGION: ${{ steps.ecr_meta.outputs.region }}
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+        run: |
+          set -euo pipefail
+          echo "Forzando nuevo despliegue en cluster=${ECS_CLUSTER} service=${ECS_SERVICE} region=${AWS_REGION}"
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" \
+            --no-cli-pager
+          echo "ECS update-service solicitado. Revisa el despliegue en la consola de AWS."
