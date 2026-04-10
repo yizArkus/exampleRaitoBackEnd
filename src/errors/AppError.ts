@@ -1,5 +1,5 @@
 /**
- * Error de aplicación con código HTTP y código estable para el cliente.
+ * Application error with HTTP status and stable machine-readable code for clients.
  */
 export class AppError extends Error {
   readonly statusCode: number;

@@ -1,8 +1,7 @@
 import cors from 'cors';
 import express from 'express';
-import { env } from './config/env';
+import { env, normalizeOrigin } from './config/env';
 import { errorHandler } from './middlewares/errorHandler';
-import { authRoutes } from './routes/authRoutes';
 import { apiRouter } from './routes';
 
 export function createApp(): express.Application {
@@ -11,7 +10,11 @@ export function createApp(): express.Application {
   app.use(
     cors({
       origin(origin, callback) {
-        if (origin === undefined || env.corsOrigins.includes(origin)) {
+        if (origin === undefined) {
+          callback(null, true);
+          return;
+        }
+        if (env.allowedOrigins.includes(normalizeOrigin(origin))) {
           callback(null, true);
           return;
         }
@@ -19,15 +22,18 @@ export function createApp(): express.Application {
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Amz-Date',
+        'X-Api-Key',
+        'X-Amz-Security-Token',
+      ],
+      optionsSuccessStatus: 204,
     })
   );
 
   app.use(express.json());
-
-  /** Auth también en /auth/* (además de /api/auth/*) para clientes que usen URL sin prefijo /api. */
-  app.use('/auth', authRoutes);
-
   app.use('/api', apiRouter);
 
   app.use((_req, res) => {
@@ -35,7 +41,7 @@ export function createApp(): express.Application {
       success: false,
       error: {
         code: 'NOT_FOUND',
-        message: 'Recurso no encontrado.',
+        message: 'Resource not found.',
       },
     });
   });

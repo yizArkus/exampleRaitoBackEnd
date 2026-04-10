@@ -2,7 +2,7 @@ import bcrypt from 'bcrypt';
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../errors/AppError';
-import { findUserByEmail } from '../models/userMock';
+import { findUserByEmail } from '../models/userRepository';
 import type { LoginSuccessPayload } from '../types/auth';
 import { isValidEmail } from '../utils/validation';
 
@@ -13,25 +13,24 @@ export async function loginWithCredentials(
   const trimmedEmail = email.trim();
 
   if (!trimmedEmail || !isValidEmail(trimmedEmail)) {
-    throw new AppError(400, 'VALIDATION_ERROR', 'Email inválido o vacío.');
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid or empty email address.');
   }
 
   if (!password || password.length === 0) {
-    throw new AppError(400, 'VALIDATION_ERROR', 'La contraseña es obligatoria.');
+    throw new AppError(400, 'VALIDATION_ERROR', 'Password is required.');
   }
 
-  const user = findUserByEmail(trimmedEmail);
+  const user = await findUserByEmail(trimmedEmail);
   if (!user) {
-    throw new AppError(401, 'INVALID_CREDENTIALS', 'Credenciales incorrectas.');
+    throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
   }
 
   const match = await bcrypt.compare(password, user.passwordHash);
   if (!match) {
-    throw new AppError(401, 'INVALID_CREDENTIALS', 'Credenciales incorrectas.');
+    throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
   }
 
   const signOptions: SignOptions = {
-    // jsonwebtoken tipa `expiresIn` con `ms.StringValue`; valor de env validado en runtime.
     expiresIn: env.jwtExpiresIn as NonNullable<SignOptions['expiresIn']>,
   };
 

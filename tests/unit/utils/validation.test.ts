@@ -1,11 +1,11 @@
 import { isValidEmail } from '../../../src/utils/validation';
 
 describe('isValidEmail', () => {
-  it('acepta un email con formato básico', () => {
+  it('accepts a basic email shape', () => {
     expect(isValidEmail('user@example.com')).toBe(true);
   });
 
-  it('rechaza cadenas vacías o sin @', () => {
+  it('rejects empty strings and strings without @', () => {
     expect(isValidEmail('')).toBe(false);
     expect(isValidEmail('not-an-email')).toBe(false);
   });

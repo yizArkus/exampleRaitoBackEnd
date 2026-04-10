@@ -4,13 +4,22 @@ import { loginWithCredentials } from '../services/authService';
 
 export async function login(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
+    if (process.env.DEBUG_LOGIN === '1') {
+      const b = req.body as Record<string, unknown>;
+      // eslint-disable-next-line no-console
+      console.log('Login attempt body:', {
+        ...b,
+        password: typeof b.password === 'string' ? '[redacted]' : b.password,
+      });
+    }
+
     const { email, password } = req.body as Record<string, unknown>;
 
     if (typeof email !== 'string' || typeof password !== 'string') {
       throw new AppError(
         400,
         'VALIDATION_ERROR',
-        'Se requieren los campos email y password como texto.'
+        'Fields "email" and "password" are required as strings.'
       );
     }
 
