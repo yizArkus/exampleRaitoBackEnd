@@ -28,10 +28,35 @@ function optionalEnv(...names: string[]): string | undefined {
   return undefined;
 }
 
+/** RDS suele exigir SSL; si PGSSLMODE no viene en la task definition, inferimos require por el hostname. */
+function isLikelyRdsHost(hostOrUrl: string): boolean {
+  return hostOrUrl.includes('.rds.amazonaws.com');
+}
+
+function sslOptionFor(hostOrUrl: string, explicitMode: string | undefined): ClientConfig['ssl'] {
+  const mode = (explicitMode ?? (isLikelyRdsHost(hostOrUrl) ? 'require' : '')).toLowerCase();
+  if (mode === 'disable' || mode === 'allow' || mode === 'prefer') {
+    return undefined;
+  }
+  if (mode === 'require' || mode === 'verify-ca' || mode === 'verify-full') {
+    return { rejectUnauthorized: false };
+  }
+  return undefined;
+}
+
 function buildPgConfig(): ClientConfig {
   const databaseUrl = optionalEnv('DATABASE_URL');
   if (databaseUrl) {
-    return { connectionString: databaseUrl };
+    const sslDisabled = /sslmode\s*=\s*disable/i.test(databaseUrl);
+    const ssl =
+      !sslDisabled && isLikelyRdsHost(databaseUrl)
+        ? { rejectUnauthorized: false as const }
+        : undefined;
+    return {
+      connectionString: databaseUrl,
+      ...(ssl ? { ssl } : {}),
+      connectionTimeoutMillis: 15_000,
+    };
   }
 
   const host = optionalEnv('POSTGRES_HOST', 'DB_HOST', 'PGHOST');
@@ -60,8 +85,8 @@ function buildPgConfig(): ClientConfig {
   }
 
   const port = Number(portRaw);
-  const sslMode = (optionalEnv('PGSSLMODE', 'POSTGRES_SSLMODE') ?? '').toLowerCase();
-  const useSsl = sslMode === 'require' || sslMode === 'verify-ca' || sslMode === 'verify-full';
+  const sslMode = optionalEnv('PGSSLMODE', 'POSTGRES_SSLMODE');
+  const ssl = sslOptionFor(host, sslMode);
 
   return {
     host,
@@ -69,8 +94,28 @@ function buildPgConfig(): ClientConfig {
     user,
     password,
     database,
-    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+    ssl,
+    connectionTimeoutMillis: 15_000,
   };
+}
+
+function logFailure(err: unknown): void {
+  if (err && typeof err === 'object') {
+    const o = err as { message?: string; code?: string; detail?: string; severity?: string };
+    // eslint-disable-next-line no-console
+    console.error(
+      '[migrate] PostgreSQL / error:',
+      JSON.stringify({
+        message: o.message,
+        code: o.code,
+        detail: o.detail,
+        severity: o.severity,
+      })
+    );
+  } else {
+    // eslint-disable-next-line no-console
+    console.error('[migrate] Error:', err);
+  }
 }
 
 async function run(): Promise<void> {
@@ -121,7 +166,6 @@ async function run(): Promise<void> {
 }
 
 void run().catch((err: unknown) => {
-  // eslint-disable-next-line no-console
-  console.error('[migrate] Error:', err instanceof Error ? err.message : err);
+  logFailure(err);
   process.exit(1);
 });

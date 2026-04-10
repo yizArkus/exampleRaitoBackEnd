@@ -16,8 +16,9 @@
 # Migraciones BD: no se ejecutan desde el runner de GitHub (RDS privado en VPC). Tras registrar la nueva
 #   revision de task definition, el pipeline lanza **ECS Run Task** (one-off) con la misma imagen y
 #   `command` override → `node dist/scripts/run-migrations.js` (misma red que el servicio).
-#   IAM del rol OIDC (mínimo): ecs:RunTask, ecs:DescribeTasks, ecs:DescribeTaskDefinition, iam:PassRole
-#   sobre executionRoleArn y taskRoleArn de la task definition.
+#   IAM del rol OIDC: adjunta una política con ecs:RunTask, ecs:DescribeTasks, ecs:DescribeTaskDefinition
+#   e iam:PassRole a los roles execution/task de la task definition (ejemplo: infra/ecs-run-task-migrate-iam-policy.json).
+#   Si ves AccessDeniedException en RunTask, falta ecs:RunTask o PassRole al rol de la task.
 # En la task definition (Secrets Manager / env): DB_* o POSTGRES_* y opcional BOOTSTRAP_ADMIN_PASSWORD
 #   para el usuario inicial (ver src/scripts/run-migrations.ts).
 # Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
