@@ -20,8 +20,10 @@
 #   Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
 #   salvo que añadas "environment: development" al job y actualices la trust policy OIDC en IAM si hace falta.
 #   POSTGRES_SSLMODE default require
-# Estrategia migración: CI aquí = simple si el runner alcanza RDS (SG público, VPN o runner self-hosted en VPC).
-#   Si RDS es solo privado y GitHub-hosted no conecta, usa init/sidecar en ECS en la misma VPC o CodeBuild en VPC.
+# Migración desde este job: el runner es GitHub-hosted (fuera de tu VPC). Si el DNS del RDS resuelve a IP
+#   privada (p. ej. 10.x) verás "No route to host": es esperable; el SG no puede abrir RDS a "internet genérica".
+#   Soluciones típicas: migrar al arrancar el contenedor en ECS (misma VPC), task ECS one-off, CodeBuild en VPC,
+#   self-hosted runner en VPC, o bastion/VPN (más frágil para CI).
 
 name: Backend CI/CD
 
@@ -301,13 +303,19 @@ jobs:
           echo "::group::Aplicar migración SQL"
           export PGPASSWORD
           export PGSSLMODE
-          psql \
+          if ! psql \
             -h "${POSTGRES_HOST}" \
             -p "${POSTGRES_PORT}" \
             -U "${POSTGRES_USER}" \
             -d "${POSTGRES_DB}" \
             -v ON_ERROR_STOP=1 \
             -f db/migrations/20260410120000_initial_users.sql
+          then
+            echo "::endgroup::"
+            echo "::error::Conexión al RDS fallida. Los runners de GitHub no están en tu VPC: si el endpoint resuelve a IP privada, no habrá ruta (No route to host / timeout)."
+            echo "::error::Quita este paso del pipeline o ejecuta migraciones dentro de AWS: task ECS one-off, script en entrypoint del servicio, CodeBuild en VPC, o runner self-hosted en la VPC."
+            exit 1
+          fi
           echo "::endgroup::"
           echo "Migración aplicada (sin mostrar contraseña)."
 
