@@ -6,7 +6,8 @@ FROM node:20-bookworm-slim AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# Sin scripts: "prepare"/husky no aplica en imagen Docker (evita exit 127).
+RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
@@ -25,7 +26,7 @@ RUN groupadd --system --gid 1001 nodejs \
   && useradd --system --uid 1001 --gid nodejs nodejs
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
 
