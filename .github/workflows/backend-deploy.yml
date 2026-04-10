@@ -98,7 +98,11 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.branch == 'develop')
     runs-on: ubuntu-latest
-    environment: development
+    # Sin "environment" aquí, el JWT OIDC usa sub tipo repo:ORG/REPO:ref:refs/heads/develop.
+    # Si necesitas el entorno GitHub (aprobaciones, secrets de entorno), vuelve a poner:
+    #   environment: development
+    # y en la trust policy del rol añade también:
+    #   repo:ORG/REPO:environment:development
     defaults:
       run:
         shell: bash
