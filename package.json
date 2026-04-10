@@ -36,6 +36,11 @@
       "src/controllers/**/*.ts",
       "src/utils/**/*.ts"
     ],
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "json-summary"
+    ],
     "coverageThreshold": {
       "global": {
         "lines": 60,
