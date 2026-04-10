@@ -266,7 +266,11 @@ jobs:
             | "\(.name) <= \(.valueFrom)"
           ')
           if [[ -n "${BAD_LINES}" ]]; then
-            echo "::error::La task definition usa valueFrom con clave JSON \"KEY\" (placeholder). Sustituye cada segmento :KEY:: por la clave real del JSON en Secrets Manager (p. ej. :DB_PASSWORD::, :JWT_SECRET::). Puente CORS: env ALLOWED_ORIGINS con valueFrom ...:CORS_ORIGINS::. Documentación: infra/ecs-secrets-mapping.md"
+            echo "::error::valueFrom usa el placeholder :KEY:: (no es una clave válida en tu JSON o sobra si el secreto es texto plano)."
+            echo "  • Secreto JSON: cambia :KEY:: por una clave que exista (aws secretsmanager get-secret-value --secret-id <id> --query SecretString --output text | jq 'keys')."
+            echo "  • Secreto en texto plano: usa solo el ARN del secreto sin :KEY:: al final."
+            echo "  • CORS: env ALLOWED_ORIGINS con ...:CORS_ORIGINS:: si la clave en el JSON es CORS_ORIGINS."
+            echo "  Ver infra/ecs-secrets-mapping.md"
             echo "${BAD_LINES}"
             exit 1
           fi
