@@ -1,5 +1,6 @@
 {
   "devDependencies": {
+    "@types/pg": "^8.15.5",
     "@types/bcrypt": "^6.0.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
@@ -21,6 +22,7 @@
   "scripts": {
     "prepare": "husky",
     "build": "tsc",
+    "migrate:run": "node dist/scripts/run-migrations.js",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "test": "jest",
@@ -58,6 +60,7 @@
     ]
   },
   "dependencies": {
+    "pg": "^8.16.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",

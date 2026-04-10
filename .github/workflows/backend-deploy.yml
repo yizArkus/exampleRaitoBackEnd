@@ -13,17 +13,15 @@
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
 # Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
-# Opcional (migración PostgreSQL / RDS): el job ejecuta db/migrations/*.sql si hay credenciales completas.
-#   - En el secreto de deploy: POSTGRES_* explícitos, O
-#   - Secreto dedicado: RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID (variable o secret GitHub; ID en AWS)
-#     con JSON: POSTGRES_* o host/username/password/port/dbname o DB_* o db_* (se fusionan).
-#   Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
+# Migraciones BD: no se ejecutan desde el runner de GitHub (RDS privado en VPC). Tras registrar la nueva
+#   revision de task definition, el pipeline lanza **ECS Run Task** (one-off) con la misma imagen y
+#   `command` override → `node dist/scripts/run-migrations.js` (misma red que el servicio).
+#   IAM del rol OIDC (mínimo): ecs:RunTask, ecs:DescribeTasks, ecs:DescribeTaskDefinition, iam:PassRole
+#   sobre executionRoleArn y taskRoleArn de la task definition.
+# En la task definition (Secrets Manager / env): DB_* o POSTGRES_* y opcional BOOTSTRAP_ADMIN_PASSWORD
+#   para el usuario inicial (ver src/scripts/run-migrations.ts).
+# Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
 #   salvo que añadas "environment: development" al job y actualices la trust policy OIDC en IAM si hace falta.
-#   POSTGRES_SSLMODE default require
-# Migración desde este job: el runner es GitHub-hosted (fuera de tu VPC). Si el DNS del RDS resuelve a IP
-#   privada (p. ej. 10.x) verás "No route to host": es esperable; el SG no puede abrir RDS a "internet genérica".
-#   Soluciones típicas: migrar al arrancar el contenedor en ECS (misma VPC), task ECS one-off, CodeBuild en VPC,
-#   self-hosted runner en VPC, o bastion/VPN (más frágil para CI).
 
 name: Backend CI/CD
 
@@ -128,9 +126,6 @@ jobs:
       # Nota: muchos equipos guardan el ARN y el id del secreto en "Repository secrets"; si vars va primero en el ||, a veces el env queda vacío en el runner.
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
       SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID }}
-      # Opcional: segundo secreto en AWS solo para credenciales RDS (nombre o ARN)
-      # Prioridad: nombre canónico, luego SecretDatbaseID (variable repo con ese nombre)
-      RDS_SECRETS_MANAGER_SECRET_ID: ${{ secrets.RDS_SECRETS_MANAGER_SECRET_ID || vars.RDS_SECRETS_MANAGER_SECRET_ID || secrets.SecretDatbaseID || vars.SecretDatbaseID }}
 
     steps:
       - name: Validate AWS role and Secrets Manager id
@@ -192,7 +187,6 @@ jobs:
         id: load-secret
         env:
           SECRET_ID: ${{ env.SECRET_NAME }}
-          RDS_SECRET_ID: ${{ env.RDS_SECRETS_MANAGER_SECRET_ID }}
         run: |
           set -euo pipefail
 
@@ -242,82 +236,7 @@ jobs:
             echo "ecs_container_name=${ECS_CONTAINER_NAME}"
           } >> "$GITHUB_OUTPUT"
 
-          MERGED_PG_JSON="${SECRET_JSON}"
-          RDS_SECOND_LOADED="no"
-          if [[ -n "${RDS_SECRET_ID:-}" ]]; then
-            echo "Cargando credenciales RDS desde secreto adicional (nombre enmascarado en AWS)."
-            RDS_JSON=$(aws secretsmanager get-secret-value \
-              --secret-id "${RDS_SECRET_ID}" \
-              --region "${AWS_REGION_DEFAULT}" \
-              --query SecretString \
-              --output text)
-            MERGED_PG_JSON=$(jq -n \
-              --argjson main "$(echo "${SECRET_JSON}" | jq -c .)" \
-              --argjson rds "$(echo "${RDS_JSON}" | jq -c .)" \
-              '$main * $rds')
-            RDS_SECOND_LOADED="yes"
-          fi
-
-          # POSTGRES_* → host/username/… (RDS) → DB_* / db_* (mayúsculas o minúsculas)
-          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // .DB_HOST // .db_host // empty')
-          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // .DB_PORT // .db_port // 5432) | tostring')
-          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // .DB_USER // .db_user // empty')
-          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // .DB_PASSWORD // .db_password // empty')
-          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // .DB_NAME // .db_name // empty')
-          POSTGRES_SSLMODE=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
-
-          if [[ -n "${POSTGRES_HOST}" && -n "${POSTGRES_USER}" && -n "${POSTGRES_PASSWORD}" && -n "${POSTGRES_DB}" ]]; then
-            echo "::add-mask::${POSTGRES_PASSWORD}"
-            {
-              echo "POSTGRES_HOST=${POSTGRES_HOST}"
-              echo "POSTGRES_PORT=${POSTGRES_PORT}"
-              echo "POSTGRES_USER=${POSTGRES_USER}"
-              echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
-              echo "POSTGRES_DB=${POSTGRES_DB}"
-              echo "POSTGRES_SSLMODE=${POSTGRES_SSLMODE}"
-            } >> "$GITHUB_ENV"
-            echo "db_migration_enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Migración DB: habilitada (credenciales solo en env, no se imprimen)."
-          else
-            echo "db_migration_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Migración DB: omitida (faltan host/usuario/contraseña/base tras mapear POSTGRES_*, host/username/…, DB_* o db_*)."
-            echo "::group::Diagnóstico migración (sin secretos)"
-            echo "Segundo secreto AWS (RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID en GitHub) cargado y fusionado: ${RDS_SECOND_LOADED}"
-            echo "Claves presentes en JSON fusionado (solo nombres): $(echo "${MERGED_PG_JSON}" | jq -r 'keys | sort | join(", ")')"
-            echo "Campos tras jq (vacío=no): host=$([[ -n "${POSTGRES_HOST}" ]] && echo ok || echo vacío) user=$([[ -n "${POSTGRES_USER}" ]] && echo ok || echo vacío) db=$([[ -n "${POSTGRES_DB}" ]] && echo ok || echo vacío) password=$([[ -n "${POSTGRES_PASSWORD}" ]] && echo ok || echo vacío)"
-            echo "::endgroup::"
-            echo "::notice::Si las credenciales están en otro secreto en AWS, define RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID como Variable o Secret del **repositorio**. Si solo lo pusiste en un Environment de GitHub, este job no lo ve: o muévelo a nivel repo, o añade environment al job y ajusta la trust policy OIDC del rol IAM."
-          fi
-
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
-
-      - name: Database migration (PostgreSQL)
-        if: steps.load-secret.outputs.db_migration_enabled == 'true'
-        env:
-          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
-          PGSSLMODE: ${{ env.POSTGRES_SSLMODE }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends postgresql-client
-          echo "::group::Aplicar migración SQL"
-          export PGPASSWORD
-          export PGSSLMODE
-          if ! psql \
-            -h "${POSTGRES_HOST}" \
-            -p "${POSTGRES_PORT}" \
-            -U "${POSTGRES_USER}" \
-            -d "${POSTGRES_DB}" \
-            -v ON_ERROR_STOP=1 \
-            -f db/migrations/20260410120000_initial_users.sql
-          then
-            echo "::endgroup::"
-            echo "::error::Conexión al RDS fallida. Los runners de GitHub no están en tu VPC: si el endpoint resuelve a IP privada, no habrá ruta (No route to host / timeout)."
-            echo "::error::Quita este paso del pipeline o ejecuta migraciones dentro de AWS: task ECS one-off, script en entrypoint del servicio, CodeBuild en VPC, o runner self-hosted en la VPC."
-            exit 1
-          fi
-          echo "::endgroup::"
-          echo "Migración aplicada (sin mostrar contraseña)."
 
       - name: Ensure ECR repository exists
         run: |
@@ -447,6 +366,102 @@ jobs:
           echo "task_def_arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
           echo "Nueva task definition: ${NEW_TASK_DEF_ARN}"
 
+      - name: Run database migrations (ECS one-off task)
+        id: ecs-migrate
+        env:
+          NEW_TASK_DEF_ARN: ${{ steps.register-task-def.outputs.task_def_arn }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          OVERRIDES_JSON=$(jq -n \
+            --arg name "${ECS_CONTAINER_NAME}" \
+            '{containerOverrides:[{name:$name,command:["node","dist/scripts/run-migrations.js"]}]}')
+
+          SERVICE_JSON=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}" \
+            --output json)
+
+          NC_JSON=$(echo "${SERVICE_JSON}" | jq -c '.services[0].networkConfiguration.awsvpcConfiguration // empty')
+          if [[ -z "${NC_JSON}" || "${NC_JSON}" == "null" ]]; then
+            echo "::error::El servicio no expone networkConfiguration.awsvpcConfiguration (se requiere awsvpc, p. ej. Fargate)."
+            exit 1
+          fi
+
+          SUBNETS=$(echo "${NC_JSON}" | jq -r '.subnets | join(",")')
+          SGS=$(echo "${NC_JSON}" | jq -r '.securityGroups | join(",")')
+          ASSIGN_PUBLIC=$(echo "${NC_JSON}" | jq -r '.assignPublicIp // "DISABLED"')
+          NETWORK_CONFIGURATION="awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SGS}],assignPublicIp=${ASSIGN_PUBLIC}}"
+
+          CP_STRATEGY=$(echo "${SERVICE_JSON}" | jq -c '.services[0].capacityProviderStrategy // []')
+          RUN_TASK_ARGS=( )
+          if [[ "$(echo "${CP_STRATEGY}" | jq 'length')" -gt 0 ]]; then
+            while IFS= read -r line; do
+              [[ -z "${line}" ]] && continue
+              RUN_TASK_ARGS+=( --capacity-provider-strategy "$line" )
+            done < <(echo "${CP_STRATEGY}" | jq -r '.[] | "capacityProvider=\(.capacityProvider),weight=\(.weight)" + (if .base != null then ",base=\(.base)" else "" end)')
+          else
+            LT=$(echo "${SERVICE_JSON}" | jq -r '.services[0].launchType // "FARGATE"')
+            RUN_TASK_ARGS+=( --launch-type "${LT}" )
+          fi
+
+          echo "::group::ECS run-task (migración)"
+          RUN_JSON=$(aws ecs run-task \
+            --cluster "${ECS_CLUSTER}" \
+            --task-definition "${NEW_TASK_DEF_ARN}" \
+            "${RUN_TASK_ARGS[@]}" \
+            --region "${AWS_REGION}" \
+            --network-configuration "${NETWORK_CONFIGURATION}" \
+            --overrides "${OVERRIDES_JSON}" \
+            --started-by "github-actions-${GH_RUN_ID}" \
+            --no-cli-pager \
+            --output json)
+
+          TASK_ARN=$(echo "${RUN_JSON}" | jq -r '.tasks[0].taskArn // empty')
+          if [[ -z "${TASK_ARN}" ]]; then
+            echo "Respuesta run-task:"
+            echo "${RUN_JSON}" | jq .
+            echo "::endgroup::"
+            echo "::error::run-task no colocó la tarea (revisa failures, IAM PassRole y permisos ecs:RunTask)."
+            exit 1
+          fi
+
+          echo "Task ARN (enmascarado en logs de CloudWatch si aplica): ${TASK_ARN}"
+          echo "::endgroup::"
+
+          echo "Esperando tasks-stopped..."
+          aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_REGION}"
+
+          DESCRIBE_JSON=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --region "${AWS_REGION}" \
+            --output json)
+
+          EXIT_CODE=$(echo "${DESCRIBE_JSON}" | jq -r --arg cname "${ECS_CONTAINER_NAME}" \
+            '[.tasks[0].containers[] | select(.name == $cname) | .exitCode] | first // empty')
+
+          if [[ -z "${EXIT_CODE}" || "${EXIT_CODE}" == "null" ]]; then
+            echo "::group::describe-tasks (sin exitCode)"
+            echo "${DESCRIBE_JSON}" | jq '.tasks[0]'
+            echo "::endgroup::"
+            echo "::error::No se obtuvo exitCode del contenedor ${ECS_CONTAINER_NAME}"
+            exit 1
+          fi
+
+          if [[ "${EXIT_CODE}" != "0" ]]; then
+            echo "::group::Tarea de migración fallida"
+            echo "${DESCRIBE_JSON}" | jq '.tasks[0] | {stoppedReason: .stoppedReason, stopCode: .stopCode, containers: .containers}'
+            echo "::endgroup::"
+            echo "::error::Migración falló con exit code ${EXIT_CODE}"
+            exit 1
+          fi
+
+          echo "migration_ok=true" >> "$GITHUB_OUTPUT"
+          echo "Migración ECS completada (exit 0)."
+
       - name: Update ECS service
         run: |
           set -euo pipefail
@@ -478,13 +493,14 @@ jobs:
             echo "| Región | \`${AWS_REGION}\` |"
             echo "| Cuenta | \`${AWS_ACCOUNT_ID}\` |"
             echo "| Repositorio ECR | \`${ECR_REPOSITORY_NAME}\` |"
-            echo "| Migración DB ejecutada | \`${{ steps.load-secret.outputs.db_migration_enabled }}\` |"
+            echo "| Migración ECS (run-task) | \`${{ steps.ecs-migrate.outputs.migration_ok }}\` |"
             echo ""
             echo "### OIDC"
             echo "Rol asumido: \`${AWS_ROLE_TO_ASSUME}\`"
             echo ""
             echo "### Notas"
             echo "- Imagen etiquetada: \`${{ steps.vars.outputs.short_sha }}\`, \`${{ steps.vars.outputs.branch_name }}\`, \`latest\`."
+            echo "- Tras registrar la task definition: **ECS run-task** ejecuta \`node dist/scripts/run-migrations.js\` en la VPC; si falla, no se llama a \`update-service\`."
             echo "- Se registró una **nueva revisión** de task definition (imagen + \`portMappings\` + \`PORT\`) y se aplicó \`force-new-deployment\`."
             echo "- Target group del ALB: path de health \`/api/health\`, puerto = \`${ECS_CONTAINER_PORT}\`."
           } >> "$GITHUB_STEP_SUMMARY"
