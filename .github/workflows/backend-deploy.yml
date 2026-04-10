@@ -13,6 +13,10 @@
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
 # Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
+# Opcional (migración PostgreSQL / RDS): si están todas, el job ejecuta db/migrations/*.sql antes del deploy ECS
+#   POSTGRES_HOST, POSTGRES_PORT (default 5432), POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_SSLMODE (default require)
+# Estrategia migración: CI aquí = simple si el runner alcanza RDS (SG público, VPN o runner self-hosted en VPC).
+#   Si RDS es solo privado y GitHub-hosted no conecta, usa init/sidecar en ECS en la misma VPC o CodeBuild en VPC.
 
 name: Backend CI/CD
 
@@ -227,7 +231,53 @@ jobs:
             echo "ecs_container_name=${ECS_CONTAINER_NAME}"
           } >> "$GITHUB_OUTPUT"
 
+          POSTGRES_HOST=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_HOST // empty')
+          POSTGRES_PORT=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_PORT // "5432"')
+          POSTGRES_USER=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_USER // empty')
+          POSTGRES_PASSWORD=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_PASSWORD // empty')
+          POSTGRES_DB=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_DB // empty')
+          POSTGRES_SSLMODE=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
+
+          if [[ -n "${POSTGRES_HOST}" && -n "${POSTGRES_USER}" && -n "${POSTGRES_PASSWORD}" && -n "${POSTGRES_DB}" ]]; then
+            echo "::add-mask::${POSTGRES_PASSWORD}"
+            {
+              echo "POSTGRES_HOST=${POSTGRES_HOST}"
+              echo "POSTGRES_PORT=${POSTGRES_PORT}"
+              echo "POSTGRES_USER=${POSTGRES_USER}"
+              echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
+              echo "POSTGRES_DB=${POSTGRES_DB}"
+              echo "POSTGRES_SSLMODE=${POSTGRES_SSLMODE}"
+            } >> "$GITHUB_ENV"
+            echo "db_migration_enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Migración DB: habilitada (credenciales solo en env, no se imprimen)."
+          else
+            echo "db_migration_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Migración DB: omitida (faltan POSTGRES_HOST/USER/PASSWORD/DB en el secreto)."
+          fi
+
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
+
+      - name: Database migration (PostgreSQL)
+        if: steps.load-secret.outputs.db_migration_enabled == 'true'
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          PGSSLMODE: ${{ env.POSTGRES_SSLMODE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          echo "::group::Aplicar migración SQL"
+          export PGPASSWORD
+          export PGSSLMODE
+          psql \
+            -h "${POSTGRES_HOST}" \
+            -p "${POSTGRES_PORT}" \
+            -U "${POSTGRES_USER}" \
+            -d "${POSTGRES_DB}" \
+            -v ON_ERROR_STOP=1 \
+            -f db/migrations/20260410120000_initial_users.sql
+          echo "::endgroup::"
+          echo "Migración aplicada (sin mostrar contraseña)."
 
       - name: Ensure ECR repository exists
         run: |
@@ -388,6 +438,7 @@ jobs:
             echo "| Región | \`${AWS_REGION}\` |"
             echo "| Cuenta | \`${AWS_ACCOUNT_ID}\` |"
             echo "| Repositorio ECR | \`${ECR_REPOSITORY_NAME}\` |"
+            echo "| Migración DB ejecutada | \`${{ steps.load-secret.outputs.db_migration_enabled }}\` |"
             echo ""
             echo "### OIDC"
             echo "Rol asumido: \`${AWS_ROLE_TO_ASSUME}\`"
