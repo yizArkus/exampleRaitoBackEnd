@@ -15,8 +15,10 @@
 # Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
 # Opcional (migración PostgreSQL / RDS): el job ejecuta db/migrations/*.sql si hay credenciales completas.
 #   - En el secreto de deploy: POSTGRES_* explícitos, O
-#   - Secreto dedicado RDS_SECRETS_MANAGER_SECRET_ID (variable o secret GitHub; el ID lo defines tú en AWS)
-#     con JSON: POSTGRES_* o host/username/password/port/dbname o DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD (se fusionan).
+#   - Secreto dedicado: RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID (variable o secret GitHub; ID en AWS)
+#     con JSON: POSTGRES_* o host/username/password/port/dbname o DB_* o db_* (se fusionan).
+#   Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
+#   salvo que añadas "environment: development" al job y actualices la trust policy OIDC en IAM si hace falta.
 #   POSTGRES_SSLMODE default require
 # Estrategia migración: CI aquí = simple si el runner alcanza RDS (SG público, VPN o runner self-hosted en VPC).
 #   Si RDS es solo privado y GitHub-hosted no conecta, usa init/sidecar en ECS en la misma VPC o CodeBuild en VPC.
@@ -125,7 +127,8 @@ jobs:
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
       SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID }}
       # Opcional: segundo secreto en AWS solo para credenciales RDS (nombre o ARN)
-      RDS_SECRETS_MANAGER_SECRET_ID: ${{ secrets.RDS_SECRETS_MANAGER_SECRET_ID || vars.RDS_SECRETS_MANAGER_SECRET_ID }}
+      # Prioridad: nombre canónico, luego SecretDatbaseID (variable repo con ese nombre)
+      RDS_SECRETS_MANAGER_SECRET_ID: ${{ secrets.RDS_SECRETS_MANAGER_SECRET_ID || vars.RDS_SECRETS_MANAGER_SECRET_ID || secrets.SecretDatbaseID || vars.SecretDatbaseID }}
 
     steps:
       - name: Validate AWS role and Secrets Manager id
@@ -238,6 +241,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           MERGED_PG_JSON="${SECRET_JSON}"
+          RDS_SECOND_LOADED="no"
           if [[ -n "${RDS_SECRET_ID:-}" ]]; then
             echo "Cargando credenciales RDS desde secreto adicional (nombre enmascarado en AWS)."
             RDS_JSON=$(aws secretsmanager get-secret-value \
@@ -249,14 +253,15 @@ jobs:
               --argjson main "$(echo "${SECRET_JSON}" | jq -c .)" \
               --argjson rds "$(echo "${RDS_JSON}" | jq -c .)" \
               '$main * $rds')
+            RDS_SECOND_LOADED="yes"
           fi
 
-          # POSTGRES_* primero; luego formato RDS (host/username/…); luego DB_* (Secrets Manager)
-          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // .DB_HOST // empty')
-          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // .DB_PORT // 5432) | tostring')
-          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // .DB_USER // empty')
-          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // .DB_PASSWORD // empty')
-          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // .DB_NAME // empty')
+          # POSTGRES_* → host/username/… (RDS) → DB_* / db_* (mayúsculas o minúsculas)
+          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // .DB_HOST // .db_host // empty')
+          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // .DB_PORT // .db_port // 5432) | tostring')
+          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // .DB_USER // .db_user // empty')
+          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // .DB_PASSWORD // .db_password // empty')
+          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // .DB_NAME // .db_name // empty')
           POSTGRES_SSLMODE=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
 
           if [[ -n "${POSTGRES_HOST}" && -n "${POSTGRES_USER}" && -n "${POSTGRES_PASSWORD}" && -n "${POSTGRES_DB}" ]]; then
@@ -273,7 +278,13 @@ jobs:
             echo "Migración DB: habilitada (credenciales solo en env, no se imprimen)."
           else
             echo "db_migration_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Migración DB: omitida (faltan host/usuario/contraseña/base en POSTGRES_*, host/username/… o DB_*)."
+            echo "Migración DB: omitida (faltan host/usuario/contraseña/base tras mapear POSTGRES_*, host/username/…, DB_* o db_*)."
+            echo "::group::Diagnóstico migración (sin secretos)"
+            echo "Segundo secreto AWS (RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID en GitHub) cargado y fusionado: ${RDS_SECOND_LOADED}"
+            echo "Claves presentes en JSON fusionado (solo nombres): $(echo "${MERGED_PG_JSON}" | jq -r 'keys | sort | join(", ")')"
+            echo "Campos tras jq (vacío=no): host=$([[ -n "${POSTGRES_HOST}" ]] && echo ok || echo vacío) user=$([[ -n "${POSTGRES_USER}" ]] && echo ok || echo vacío) db=$([[ -n "${POSTGRES_DB}" ]] && echo ok || echo vacío) password=$([[ -n "${POSTGRES_PASSWORD}" ]] && echo ok || echo vacío)"
+            echo "::endgroup::"
+            echo "::notice::Si las credenciales están en otro secreto en AWS, define RDS_SECRETS_MANAGER_SECRET_ID o SecretDatbaseID como Variable o Secret del **repositorio**. Si solo lo pusiste en un Environment de GitHub, este job no lo ve: o muévelo a nivel repo, o añade environment al job y ajusta la trust policy OIDC del rol IAM."
           fi
 
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
