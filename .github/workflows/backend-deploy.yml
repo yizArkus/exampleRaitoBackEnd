@@ -12,6 +12,7 @@
 #
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
+# Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
 
 name: Backend CI/CD
 
@@ -204,6 +205,11 @@ jobs:
           ECS_SERVICE=$(read_secret ECS_SERVICE)
           ECS_CONTAINER_NAME=$(read_secret ECS_CONTAINER_NAME)
 
+          ECS_CONTAINER_PORT=$(echo "${SECRET_JSON}" | jq -r '.ECS_CONTAINER_PORT // "8080"')
+          if [[ -z "${ECS_CONTAINER_PORT}" || "${ECS_CONTAINER_PORT}" == "null" ]]; then
+            ECS_CONTAINER_PORT="8080"
+          fi
+
           {
             echo "AWS_REGION=${AWS_REGION}"
             echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}"
@@ -211,6 +217,7 @@ jobs:
             echo "ECS_CLUSTER=${ECS_CLUSTER}"
             echo "ECS_SERVICE=${ECS_SERVICE}"
             echo "ECS_CONTAINER_NAME=${ECS_CONTAINER_NAME}"
+            echo "ECS_CONTAINER_PORT=${ECS_CONTAINER_PORT}"
           } >> "$GITHUB_ENV"
 
           {
@@ -267,6 +274,7 @@ jobs:
           set -euo pipefail
 
           echo "Contenedor ECS: ${ECS_CONTAINER_NAME}"
+          echo "Puerto contenedor (ALB/TG): ${ECS_CONTAINER_PORT}"
           echo "Imagen nueva: ${NEW_IMAGE}"
 
           TASK_DEF_ARN=$(aws ecs describe-services \
@@ -288,7 +296,7 @@ jobs:
             --region "${AWS_REGION}")
 
           # Registro: quitar campos de solo lectura; imágenes por contenedor; opcionales nulos seguros
-          NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq --arg IMAGE "${NEW_IMAGE}" --arg CONTAINER "${ECS_CONTAINER_NAME}" '
+          NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq --arg IMAGE "${NEW_IMAGE}" --arg CONTAINER "${ECS_CONTAINER_NAME}" --arg CPORT "${ECS_CONTAINER_PORT}" '
             .taskDefinition
             | del(
                 .taskDefinitionArn,
@@ -301,7 +309,15 @@ jobs:
                 .deregisteredAt
               )
             | .containerDefinitions |= map(
-                if .name == $CONTAINER then .image = $IMAGE else . end
+                if .name == $CONTAINER then
+                  .image = $IMAGE
+                  | .portMappings = [{ "containerPort": ($CPORT | tonumber), "protocol": "tcp" }]
+                  | .environment = (
+                      ((.environment // []) | map(select(.name != "PORT"))) + [{ "name": "PORT", "value": $CPORT }]
+                    )
+                else
+                  .
+                end
               )
             | .volumes = (.volumes // [])
             | .placementConstraints = (.placementConstraints // [])
@@ -367,6 +383,7 @@ jobs:
             echo "| Cluster | \`${ECS_CLUSTER}\` |"
             echo "| Servicio | \`${ECS_SERVICE}\` |"
             echo "| Contenedor actualizado | \`${ECS_CONTAINER_NAME}\` |"
+            echo "| Puerto contenedor (ALB/TG) | \`${ECS_CONTAINER_PORT}\` |"
             echo "| Task definition | \`${{ steps.register-task-def.outputs.task_def_arn }}\` |"
             echo "| Región | \`${AWS_REGION}\` |"
             echo "| Cuenta | \`${AWS_ACCOUNT_ID}\` |"
@@ -377,5 +394,6 @@ jobs:
             echo ""
             echo "### Notas"
             echo "- Imagen etiquetada: \`${{ steps.vars.outputs.short_sha }}\`, \`${{ steps.vars.outputs.branch_name }}\`, \`latest\`."
-            echo "- Se registró una **nueva revisión** de task definition y se aplicó \`force-new-deployment\`."
+            echo "- Se registró una **nueva revisión** de task definition (imagen + \`portMappings\` + \`PORT\`) y se aplicó \`force-new-deployment\`."
+            echo "- Target group del ALB: path de health \`/api/health\`, puerto = \`${ECS_CONTAINER_PORT}\`."
           } >> "$GITHUB_STEP_SUMMARY"
