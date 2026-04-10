@@ -1,10 +1,14 @@
 # CI: lint, typecheck, tests + cobertura
 # CD (solo develop): OIDC → Secrets Manager → buildx (GHA cache) → ECR → nueva task definition → ECS
 #
-# Variables de repositorio (Settings → Variables):
-#   AWS_ROLE_TO_ASSUME          ARN del rol IAM para GitHub OIDC
-#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto en Secrets Manager (JSON con claves abajo)
-#   AWS_REGION_DEFAULT          Región donde está el secreto (y sesión inicial AWS CLI), ej. us-east-1
+# Configuración (una de estas opciones por clave):
+#   Settings → Actions → Variables (repositorio), O
+#   Settings → Environments → development → Environment variables, O
+#   Settings → Actions → Secrets (mismos nombres; valores enmascarados en logs)
+#
+#   AWS_ROLE_TO_ASSUME             ARN del rol IAM para GitHub OIDC
+#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto en AWS Secrets Manager (JSON abajo)
+#   AWS_REGION_DEFAULT             (opcional) Región del get-secret-value inicial, ej. us-east-1
 #
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
@@ -33,9 +37,7 @@ permissions:
 env:
   NODE_VERSION: "20"
   DOCKERFILE_PATH: ./Dockerfile
-  # Valores por defecto; sobreescribibles con variables de repositorio
   AWS_REGION_DEFAULT: ${{ vars.AWS_REGION_DEFAULT || 'us-east-1' }}
-  SECRET_NAME: ${{ vars.AWS_SECRETS_MANAGER_SECRET_ID }}
 
 jobs:
   ci:
@@ -106,17 +108,22 @@ jobs:
       id-token: write
 
     env:
-      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      # Prioridad: Repository/Environment Secrets, luego Variables (mismo nombre).
+      # Nota: muchos equipos guardan el ARN y el id del secreto en "Repository secrets"; si vars va primero en el ||, a veces el env queda vacío en el runner.
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
+      SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID }}
 
     steps:
-      - name: Validate required repository variables
+      - name: Validate AWS role and Secrets Manager id
         run: |
           set -euo pipefail
           missing=()
           [[ -z "${AWS_ROLE_TO_ASSUME:-}" ]] && missing+=("AWS_ROLE_TO_ASSUME")
           [[ -z "${SECRET_NAME:-}" ]] && missing+=("AWS_SECRETS_MANAGER_SECRET_ID")
           if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "::error::Faltan variables de repositorio: ${missing[*]}"
+            echo "::error::Faltan valores para: ${missing[*]}"
+            echo "Define Repository secrets o Variables con esos nombres (o el entorno development)."
+            echo "Si usas solo Secrets: Settings → Actions → Secrets (como en tu captura)."
             exit 1
           fi
 
