@@ -10,7 +10,8 @@
 import bcrypt from 'bcrypt';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Client, type ClientConfig } from 'pg';
+import { Client } from 'pg';
+import { buildPgConfig, optionalEnv } from '../config/pgConnection';
 
 /** Constantes de lock estables entre ejecuciones (no usar random). */
 const ADVISORY_KEY_1 = 0x72616974; // 'rait'
@@ -21,87 +22,6 @@ const DDL_RELATIVE = '../../db/migrations/20260410120000_initial_users.sql';
 const DEFAULT_BOOTSTRAP_EMAIL = 'ygonzalez@arkusnexus.com';
 /** Solo desarrollo / bootstrap; en producción define BOOTSTRAP_ADMIN_PASSWORD en Secrets Manager. */
 const DEFAULT_BOOTSTRAP_PASSWORD = 'admin123';
-
-function optionalEnv(...names: string[]): string | undefined {
-  for (const n of names) {
-    const v = process.env[n];
-    if (v !== undefined && v.trim() !== '') {
-      return v.trim();
-    }
-  }
-  return undefined;
-}
-
-/** RDS suele exigir SSL; si PGSSLMODE no viene en la task definition, inferimos require por el hostname. */
-function isLikelyRdsHost(hostOrUrl: string): boolean {
-  return hostOrUrl.includes('.rds.amazonaws.com');
-}
-
-function sslOptionFor(hostOrUrl: string, explicitMode: string | undefined): ClientConfig['ssl'] {
-  const mode = (explicitMode ?? (isLikelyRdsHost(hostOrUrl) ? 'require' : '')).toLowerCase();
-  if (mode === 'disable' || mode === 'allow' || mode === 'prefer') {
-    return undefined;
-  }
-  if (mode === 'require' || mode === 'verify-ca' || mode === 'verify-full') {
-    return { rejectUnauthorized: false };
-  }
-  return undefined;
-}
-
-function buildPgConfig(): ClientConfig {
-  const databaseUrl = optionalEnv('DATABASE_URL');
-  if (databaseUrl) {
-    const sslDisabled = /sslmode\s*=\s*disable/i.test(databaseUrl);
-    const ssl =
-      !sslDisabled && isLikelyRdsHost(databaseUrl)
-        ? { rejectUnauthorized: false as const }
-        : undefined;
-    return {
-      connectionString: databaseUrl,
-      ...(ssl ? { ssl } : {}),
-      connectionTimeoutMillis: 15_000,
-    };
-  }
-
-  const host = optionalEnv('POSTGRES_HOST', 'DB_HOST', 'PGHOST');
-  const portRaw = optionalEnv('POSTGRES_PORT', 'DB_PORT', 'PGPORT', 'db_port') ?? '5432';
-  const user = optionalEnv('POSTGRES_USER', 'DB_USER', 'PGUSER', 'username', 'db_user');
-  const password = optionalEnv(
-    'POSTGRES_PASSWORD',
-    'DB_PASSWORD',
-    'PGPASSWORD',
-    'password',
-    'db_password'
-  );
-  const database = optionalEnv(
-    'POSTGRES_DB',
-    'DB_NAME',
-    'PGDATABASE',
-    'dbname',
-    'database',
-    'db_name'
-  );
-
-  if (!host || !user || password === undefined || !database) {
-    throw new Error(
-      'Faltan credenciales de BD: define DATABASE_URL o POSTGRES_* / DB_* (host, user, password, database).'
-    );
-  }
-
-  const port = Number(portRaw);
-  const sslMode = optionalEnv('PGSSLMODE', 'POSTGRES_SSLMODE');
-  const ssl = sslOptionFor(host, sslMode);
-
-  return {
-    host,
-    port: Number.isFinite(port) ? port : 5432,
-    user,
-    password,
-    database,
-    ssl,
-    connectionTimeoutMillis: 15_000,
-  };
-}
 
 function logFailure(err: unknown): void {
   if (err && typeof err === 'object') {

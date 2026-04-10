@@ -2,7 +2,7 @@ import bcrypt from 'bcrypt';
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AppError } from '../errors/AppError';
-import { findUserByEmail } from '../models/userMock';
+import { findUserByEmail } from '../models/userRepository';
 import type { LoginSuccessPayload } from '../types/auth';
 import { isValidEmail } from '../utils/validation';
 
@@ -20,7 +20,7 @@ export async function loginWithCredentials(
     throw new AppError(400, 'VALIDATION_ERROR', 'La contraseña es obligatoria.');
   }
 
-  const user = findUserByEmail(trimmedEmail);
+  const user = await findUserByEmail(trimmedEmail);
   if (!user) {
     throw new AppError(401, 'INVALID_CREDENTIALS', 'Credenciales incorrectas.');
   }
