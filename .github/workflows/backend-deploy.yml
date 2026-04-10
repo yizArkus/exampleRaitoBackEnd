@@ -1,32 +1,32 @@
-# CI: lint, typecheck, tests + cobertura
-# CD (solo develop): OIDC → Secrets Manager → buildx (GHA cache) → ECR → nueva task definition → ECS
+# CI: lint, typecheck, tests, coverage
+# CD (develop only): OIDC → Secrets Manager → buildx (GHA cache) → ECR → new ECS task definition → ECS
 #
-# Configuración (una de estas opciones por clave):
-#   Settings → Actions → Variables (repositorio), O
-#   Settings → Environments → development → Environment variables, O
-#   Settings → Actions → Secrets (mismos nombres; valores enmascarados en logs)
+# Configure each key via one of:
+#   Settings → Actions → Variables (repository), or
+#   Settings → Environments → development → Environment variables, or
+#   Settings → Actions → Secrets (same names; values masked in logs)
 #
-#   AWS_ROLE_TO_ASSUME             ARN del rol IAM para GitHub OIDC
-#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto CI/CD en Secrets Manager (JSON abajo).
-#                                  Por defecto en el workflow: an-raito-cicd-dev (si no defines secret/var).
-#   AWS_REGION_DEFAULT             (opcional) Región del get-secret-value inicial, ej. us-east-1
-#   AWS_RDS_SECRET_ID, AWS_STORE_SECRET_ID (opcional) Nombres en Secrets Manager; por defecto
-#   an-raito-dev-rds-credentials-v1 y an-raito-dev-store-v1. El job registra la task definition con
-#   valueFrom ${ARN}:DB_HOST::, … y ALLOWED_ORIGINS <= CORS_ORIGINS (sin :KEY::).
+#   AWS_ROLE_TO_ASSUME             IAM role ARN for GitHub OIDC
+#   AWS_SECRETS_MANAGER_SECRET_ID  Name or ARN of the CI/CD secret in Secrets Manager (JSON below).
+#                                  Workflow default: an-raito-cicd-dev if secret/var is unset.
+#   AWS_REGION_DEFAULT             (optional) Region for initial get-secret-value, e.g. us-east-1
+#   AWS_RDS_SECRET_ID, AWS_STORE_SECRET_ID  (optional) Secret names; defaults
+#   an-raito-dev-rds-credentials-v1 and an-raito-dev-store-v1. The job registers the task definition with
+#   valueFrom ${ARN}:DB_HOST::, … and ALLOWED_ORIGINS from CORS_ORIGINS (no :KEY::).
 #
-# El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
+# The Secrets Manager JSON must include (not hardcoded in the workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
-# Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
-# Migraciones BD: no se ejecutan desde el runner de GitHub (RDS privado en VPC). Tras registrar la nueva
-#   revision de task definition, el pipeline lanza **ECS Run Task** (one-off) con la misma imagen y
-#   `command` override → `node dist/scripts/run-migrations.js` (misma red que el servicio).
-#   IAM del rol OIDC: adjunta una política con ecs:RunTask, ecs:DescribeTasks, ecs:DescribeTaskDefinition
-#   e iam:PassRole a los roles execution/task de la task definition (ejemplo: infra/ecs-run-task-migrate-iam-policy.json).
-#   Si ves AccessDeniedException en RunTask, falta ecs:RunTask o PassRole al rol de la task.
-# En la task definition (Secrets Manager / env): DB_* o POSTGRES_* y opcional BOOTSTRAP_ADMIN_PASSWORD
-#   para el usuario inicial (ver src/scripts/run-migrations.ts).
-# Importante: este job NO usa environment: GitHub. Las variables del Environment "development" NO aplican
-#   salvo que añadas "environment: development" al job y actualices la trust policy OIDC en IAM si hace falta.
+# Optional: ECS_CONTAINER_PORT (default 8080) — must match the ALB target group port
+# DB migrations: not run from the GitHub runner (RDS is private in the VPC). After registering a new
+#   task definition revision, the pipeline runs **ECS Run Task** (one-off) with the same image and
+#   `command` override → `node dist/scripts/run-migrations.js` (same network as the service).
+#   OIDC role IAM: attach a policy with ecs:RunTask, ecs:DescribeTasks, ecs:DescribeTaskDefinition
+#   and iam:PassRole to the task execution/task roles (configure IAM in AWS per ECS docs).
+#   If you see AccessDeniedException on RunTask, add ecs:RunTask or PassRole for the task role.
+# Task definition (Secrets Manager / env): DB_* or POSTGRES_* and optional BOOTSTRAP_ADMIN_PASSWORD
+#   for the initial user (see src/scripts/run-migrations.ts).
+# Note: this job does not set GitHub `environment`. Environment "development" variables do not apply
+#   unless you add `environment: development` to the job and update the OIDC trust policy in IAM if needed.
 
 name: Backend CI/CD
 
@@ -38,9 +38,10 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Rama a desplegar (solo develop)"
+        description: "Branch to deploy (develop only)"
         required: true
         default: "develop"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -112,10 +113,10 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.branch == 'develop')
     runs-on: ubuntu-latest
-    # Sin "environment" aquí, el JWT OIDC usa sub tipo repo:ORG/REPO:ref:refs/heads/develop.
-    # Si necesitas el entorno GitHub (aprobaciones, secrets de entorno), vuelve a poner:
+    # Without `environment` here, OIDC JWT subject is repo:ORG/REPO:ref:refs/heads/develop.
+    # To use a GitHub Environment (approvals, environment secrets), add:
     #   environment: development
-    # y en la trust policy del rol añade también:
+    # and extend the role trust policy with:
     #   repo:ORG/REPO:environment:development
     defaults:
       run:
@@ -126,10 +127,10 @@ jobs:
       id-token: write
 
     env:
-      # Prioridad: Repository/Environment Secrets, luego Variables (mismo nombre).
-      # Nota: muchos equipos guardan el ARN y el id del secreto en "Repository secrets"; si vars va primero en el ||, a veces el env queda vacío en el runner.
+      # Order: Repository/Environment Secrets, then Variables (same name).
+      # Note: teams often store the ARN in Repository secrets; if `vars` is listed first in ||, the runner env may be empty.
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
-      # Secreto con AWS_REGION, ECS_CLUSTER, ECR_REPOSITORY_NAME, etc. (dev: an-raito-cicd-dev)
+      # CI/CD secret with AWS_REGION, ECS_CLUSTER, ECR_REPOSITORY_NAME, etc. (dev default: an-raito-cicd-dev)
       SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID || 'an-raito-cicd-dev' }}
 
     steps:
@@ -140,9 +141,9 @@ jobs:
           [[ -z "${AWS_ROLE_TO_ASSUME:-}" ]] && missing+=("AWS_ROLE_TO_ASSUME")
           [[ -z "${SECRET_NAME:-}" ]] && missing+=("AWS_SECRETS_MANAGER_SECRET_ID")
           if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "::error::Faltan valores para: ${missing[*]}"
-            echo "Define Repository secrets o Variables con esos nombres (o el entorno development)."
-            echo "Si usas solo Secrets: Settings → Actions → Secrets (como en tu captura)."
+            echo "::error::Missing required values: ${missing[*]}"
+            echo "Set Repository secrets or Variables with those names (or use the development environment)."
+            echo "If using only Secrets: Settings → Actions → Secrets."
             exit 1
           fi
 
@@ -151,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ github.event.inputs.branch }}" != "develop" ]]; then
-            echo "::error::Solo se permite desplegar manualmente la rama develop"
+            echo "::error::Manual deploy is allowed only for branch develop"
             exit 1
           fi
 
@@ -206,7 +207,7 @@ jobs:
             local val
             val=$(echo "${SECRET_JSON}" | jq -r --arg k "$key" '.[$k] // empty')
             if [[ -z "${val}" || "${val}" == "null" ]]; then
-              echo "::error::Clave obligatoria ausente o nula en el secreto: ${key}"
+              echo "::error::Required key missing or null in secret: ${key}"
               exit 1
             fi
             printf '%s' "${val}"
@@ -241,13 +242,13 @@ jobs:
             echo "ecs_container_name=${ECS_CONTAINER_NAME}"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Config cargada desde Secrets Manager (valores no mostrados)."
+          echo "Deploy config loaded from Secrets Manager (values not logged)."
 
       - name: Ensure ECR repository exists
         run: |
           set -euo pipefail
           if ! aws ecr describe-repositories --repository-names "${ECR_REPOSITORY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-            echo "Creando repositorio ECR: ${ECR_REPOSITORY_NAME}"
+            echo "Creating ECR repository: ${ECR_REPOSITORY_NAME}"
             aws ecr create-repository --repository-name "${ECR_REPOSITORY_NAME}" --region "${AWS_REGION}" --no-cli-pager
           fi
 
@@ -289,12 +290,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Contenedor ECS: ${ECS_CONTAINER_NAME}"
-          echo "Puerto contenedor (ALB/TG): ${ECS_CONTAINER_PORT}"
-          echo "Imagen nueva: ${NEW_IMAGE}"
+          echo "ECS container: ${ECS_CONTAINER_NAME}"
+          echo "Container port (ALB/TG): ${ECS_CONTAINER_PORT}"
+          echo "New image: ${NEW_IMAGE}"
 
           if [[ -z "${RDS_SECRET_ID}" || -z "${STORE_SECRET_ID}" ]]; then
-            echo "::error::RDS_SECRET_ID y STORE_SECRET_ID deben estar definidos (vars AWS_RDS_SECRET_ID / AWS_STORE_SECRET_ID o valores por defecto en el workflow)."
+            echo "::error::RDS_SECRET_ID and STORE_SECRET_ID must be set (vars AWS_RDS_SECRET_ID / AWS_STORE_SECRET_ID or workflow defaults)."
             exit 1
           fi
 
@@ -310,11 +311,11 @@ jobs:
             --output text | tr -d '\r\n')
 
           if [[ -z "${RDS_SECRET_ARN}" || -z "${STORE_SECRET_ARN}" ]]; then
-            echo "::error::No se pudo resolver el ARN de Secrets Manager (describe-secret vacío)."
+            echo "::error::Could not resolve Secrets Manager ARN (describe-secret returned empty)."
             exit 1
           fi
 
-          echo "Validando claves JSON en ${RDS_SECRET_ID} y ${STORE_SECRET_ID}..."
+          echo "Validating JSON keys in ${RDS_SECRET_ID} and ${STORE_SECRET_ID}..."
           RDS_JSON=$(aws secretsmanager get-secret-value \
             --secret-id "${RDS_SECRET_ID}" \
             --region "${AWS_REGION}" \
@@ -322,7 +323,7 @@ jobs:
             --output text)
           for k in DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD; do
             if ! echo "${RDS_JSON}" | jq -e --arg k "$k" '(.[$k] != null) and ((.[$k] | tostring | length) > 0)' >/dev/null; then
-              echo "::error::El secreto RDS debe incluir una clave JSON no vacía: ${k}"
+              echo "::error::RDS secret must include a non-empty JSON key: ${k}"
               exit 1
             fi
           done
@@ -333,7 +334,7 @@ jobs:
             --query SecretString \
             --output text)
           if ! echo "${STORE_JSON}" | jq -e '(.CORS_ORIGINS != null) and ((.CORS_ORIGINS | tostring | length) > 0)' >/dev/null; then
-            echo "::error::El secreto store debe incluir CORS_ORIGINS (no vacío) para mapear a ALLOWED_ORIGINS."
+            echo "::error::Store secret must include non-empty CORS_ORIGINS to map to ALLOWED_ORIGINS."
             exit 1
           fi
 
@@ -345,17 +346,17 @@ jobs:
             --output text)
 
           if [[ -z "${TASK_DEF_ARN}" || "${TASK_DEF_ARN}" == "None" ]]; then
-            echo "::error::No se pudo resolver la task definition del servicio"
+            echo "::error::Could not resolve task definition for the service"
             exit 1
           fi
 
-          echo "Task definition actual: ${TASK_DEF_ARN}"
+          echo "Current task definition: ${TASK_DEF_ARN}"
 
           TASK_DEF_JSON=$(aws ecs describe-task-definition \
             --task-definition "${TASK_DEF_ARN}" \
             --region "${AWS_REGION}")
 
-          # Registro: imagen, PORT, y secrets con ARNs reales (sin :KEY::)
+          # Register: image, PORT, and secrets with real ARNs (no :KEY::)
           NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq \
             --arg IMAGE "${NEW_IMAGE}" \
             --arg CONTAINER "${ECS_CONTAINER_NAME}" \
@@ -434,11 +435,11 @@ jobs:
             --no-cli-pager)
 
           echo "task_def_arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
-          echo "Nueva task definition: ${NEW_TASK_DEF_ARN}"
+          echo "New task definition: ${NEW_TASK_DEF_ARN}"
 
       # Migration uses the same task definition as the service. If run-task fails with
       # "did not contain json key", fix ECS task definition Secrets: each valueFrom JSON key
-      # must exist in the Secrets Manager secret JSON (see infra/ecs-secrets-valueFrom-format.txt).
+      # must exist in the Secrets Manager secret JSON (see AWS ECS secrets documentation).
       - name: Run database migrations (ECS one-off task)
         id: ecs-migrate
         env:
@@ -459,7 +460,7 @@ jobs:
 
           NC_JSON=$(echo "${SERVICE_JSON}" | jq -c '.services[0].networkConfiguration.awsvpcConfiguration // empty')
           if [[ -z "${NC_JSON}" || "${NC_JSON}" == "null" ]]; then
-            echo "::error::El servicio no expone networkConfiguration.awsvpcConfiguration (se requiere awsvpc, p. ej. Fargate)."
+            echo "::error::Service has no networkConfiguration.awsvpcConfiguration (awsvpc required, e.g. Fargate)."
             exit 1
           fi
 
@@ -480,7 +481,7 @@ jobs:
             RUN_TASK_ARGS+=( --launch-type "${LT}" )
           fi
 
-          echo "::group::ECS run-task (migración)"
+          echo "::group::ECS run-task (database migration)"
           RUN_JSON=$(aws ecs run-task \
             --cluster "${ECS_CLUSTER}" \
             --task-definition "${NEW_TASK_DEF_ARN}" \
@@ -494,17 +495,17 @@ jobs:
 
           TASK_ARN=$(echo "${RUN_JSON}" | jq -r '.tasks[0].taskArn // empty')
           if [[ -z "${TASK_ARN}" ]]; then
-            echo "Respuesta run-task:"
+            echo "run-task response:"
             echo "${RUN_JSON}" | jq .
             echo "::endgroup::"
-            echo "::error::run-task no colocó la tarea (revisa failures, IAM PassRole y permisos ecs:RunTask)."
+            echo "::error::run-task did not place a task (check failures, IAM PassRole, ecs:RunTask)."
             exit 1
           fi
 
-          echo "Task ARN (enmascarado en logs de CloudWatch si aplica): ${TASK_ARN}"
+          echo "Task ARN: ${TASK_ARN}"
           echo "::endgroup::"
 
-          echo "Esperando tasks-stopped..."
+          echo "Waiting for tasks-stopped..."
           aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" --region "${AWS_REGION}"
 
           DESCRIBE_JSON=$(aws ecs describe-tasks \
@@ -541,7 +542,7 @@ jobs:
           fi
 
           echo "migration_ok=true" >> "$GITHUB_OUTPUT"
-          echo "Migración ECS completada (exit 0)."
+          echo "ECS migration completed (exit 0)."
 
       - name: Update ECS service
         run: |
@@ -558,30 +559,30 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "## Despliegue Develop — ECR & ECS"
+            echo "## Develop deploy — ECR & ECS"
             echo ""
-            echo "| Campo | Valor |"
+            echo "| Field | Value |"
             echo "|--------|--------|"
-            echo "| Rama / ref | \`${GITHUB_REF_NAME}\` |"
-            echo "| Commit (corto) | \`${{ steps.vars.outputs.short_sha }}\` |"
-            echo "| Tag rama | \`${{ steps.vars.outputs.branch_name }}\` |"
-            echo "| Imagen (commit) | \`${{ steps.image-meta.outputs.image_uri }}\` |"
+            echo "| Branch / ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Short commit | \`${{ steps.vars.outputs.short_sha }}\` |"
+            echo "| Branch tag | \`${{ steps.vars.outputs.branch_name }}\` |"
+            echo "| Image (commit) | \`${{ steps.image-meta.outputs.image_uri }}\` |"
             echo "| Cluster | \`${ECS_CLUSTER}\` |"
-            echo "| Servicio | \`${ECS_SERVICE}\` |"
-            echo "| Contenedor actualizado | \`${ECS_CONTAINER_NAME}\` |"
-            echo "| Puerto contenedor (ALB/TG) | \`${ECS_CONTAINER_PORT}\` |"
+            echo "| Service | \`${ECS_SERVICE}\` |"
+            echo "| Updated container | \`${ECS_CONTAINER_NAME}\` |"
+            echo "| Container port (ALB/TG) | \`${ECS_CONTAINER_PORT}\` |"
             echo "| Task definition | \`${{ steps.register-task-def.outputs.task_def_arn }}\` |"
-            echo "| Región | \`${AWS_REGION}\` |"
-            echo "| Cuenta | \`${AWS_ACCOUNT_ID}\` |"
-            echo "| Repositorio ECR | \`${ECR_REPOSITORY_NAME}\` |"
-            echo "| Migración ECS (run-task) | \`${{ steps.ecs-migrate.outputs.migration_ok }}\` |"
+            echo "| Region | \`${AWS_REGION}\` |"
+            echo "| Account | \`${AWS_ACCOUNT_ID}\` |"
+            echo "| ECR repository | \`${ECR_REPOSITORY_NAME}\` |"
+            echo "| ECS migration (run-task) | \`${{ steps.ecs-migrate.outputs.migration_ok }}\` |"
             echo ""
             echo "### OIDC"
-            echo "Rol asumido: \`${AWS_ROLE_TO_ASSUME}\`"
+            echo "Assumed role: \`${AWS_ROLE_TO_ASSUME}\`"
             echo ""
-            echo "### Notas"
-            echo "- Imagen etiquetada: \`${{ steps.vars.outputs.short_sha }}\`, \`${{ steps.vars.outputs.branch_name }}\`, \`latest\`."
-            echo "- Tras registrar la task definition: **ECS run-task** ejecuta \`node dist/scripts/run-migrations.js\` en la VPC; si falla, no se llama a \`update-service\`."
-            echo "- Se registró una **nueva revisión** de task definition (imagen + \`portMappings\` + \`PORT\`) y se aplicó \`force-new-deployment\`."
-            echo "- Target group del ALB: path de health \`/api/health\`, puerto = \`${ECS_CONTAINER_PORT}\`."
+            echo "### Notes"
+            echo "- Image tags: \`${{ steps.vars.outputs.short_sha }}\`, \`${{ steps.vars.outputs.branch_name }}\`, \`latest\`."
+            echo "- After registering the task definition, **ECS run-task** runs \`node dist/scripts/run-migrations.js\` in the VPC; on failure, \`update-service\` is skipped."
+            echo "- A new task definition revision was registered (image + \`portMappings\` + \`PORT\`) and \`force-new-deployment\` was applied."
+            echo "- ALB target group health path \`/api/health\`, port = \`${ECS_CONTAINER_PORT}\`."
           } >> "$GITHUB_STEP_SUMMARY"
