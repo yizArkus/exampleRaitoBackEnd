@@ -239,6 +239,39 @@ jobs:
 
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
 
+      # Falla antes de build/push si la task definition aún tiene el placeholder :KEY:: en valueFrom
+      # (ResourceInitializationError / "did not contain json key KEY" en run-task de migración).
+      - name: Validate ECS task definition secrets (no JSON key placeholder KEY)
+        run: |
+          set -euo pipefail
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}" \
+            --query "services[0].taskDefinition" \
+            --output text)
+          if [[ -z "${TASK_DEF_ARN}" || "${TASK_DEF_ARN}" == "None" ]]; then
+            echo "::error::No se pudo resolver la task definition del servicio"
+            exit 1
+          fi
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_DEF_ARN}" \
+            --region "${AWS_REGION}" \
+            --output json)
+          BAD_LINES=$(echo "${TASK_DEF_JSON}" | jq -r --arg cname "${ECS_CONTAINER_NAME}" '
+            .taskDefinition.containerDefinitions[]
+            | select(.name == $cname)
+            | .secrets[]?
+            | select(.valueFrom | test(":KEY::"))
+            | "\(.name) <= \(.valueFrom)"
+          ')
+          if [[ -n "${BAD_LINES}" ]]; then
+            echo "::error::La task definition usa valueFrom con clave JSON \"KEY\" (placeholder). Sustituye cada segmento :KEY:: por la clave real del JSON en Secrets Manager (p. ej. :DB_PASSWORD::, :JWT_SECRET::). Puente CORS: env ALLOWED_ORIGINS con valueFrom ...:CORS_ORIGINS::. Documentación: infra/ecs-secrets-mapping.md"
+            echo "${BAD_LINES}"
+            exit 1
+          fi
+          echo "OK: contenedor ${ECS_CONTAINER_NAME} sin :KEY:: en secrets."
+
       - name: Ensure ECR repository exists
         run: |
           set -euo pipefail
