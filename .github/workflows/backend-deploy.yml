@@ -15,8 +15,8 @@
 # Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
 # Opcional (migración PostgreSQL / RDS): el job ejecuta db/migrations/*.sql si hay credenciales completas.
 #   - En el secreto de deploy: POSTGRES_* explícitos, O
-#   - Secreto dedicado RDS_SECRETS_MANAGER_SECRET_ID (variable o secret GitHub), p. ej. an-raito-dev-rds-credentials-v1
-#     con JSON estilo AWS RDS: host, username, password, port, dbname (y/o POSTGRES_*; se fusionan).
+#   - Secreto dedicado RDS_SECRETS_MANAGER_SECRET_ID (variable o secret GitHub; el ID lo defines tú en AWS)
+#     con JSON: POSTGRES_* o host/username/password/port/dbname o DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD (se fusionan).
 #   POSTGRES_SSLMODE default require
 # Estrategia migración: CI aquí = simple si el runner alcanza RDS (SG público, VPN o runner self-hosted en VPC).
 #   Si RDS es solo privado y GitHub-hosted no conecta, usa init/sidecar en ECS en la misma VPC o CodeBuild en VPC.
@@ -251,12 +251,12 @@ jobs:
               '$main * $rds')
           fi
 
-          # Acepta POSTGRES_* o claves típicas del secreto gestionado por RDS (host, username, password, dbname, port)
-          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // empty')
-          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // 5432) | tostring')
-          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // empty')
-          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // empty')
-          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // empty')
+          # POSTGRES_* primero; luego formato RDS (host/username/…); luego DB_* (Secrets Manager)
+          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // .DB_HOST // empty')
+          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // .DB_PORT // 5432) | tostring')
+          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // .DB_USER // empty')
+          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // .DB_PASSWORD // empty')
+          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // .DB_NAME // empty')
           POSTGRES_SSLMODE=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
 
           if [[ -n "${POSTGRES_HOST}" && -n "${POSTGRES_USER}" && -n "${POSTGRES_PASSWORD}" && -n "${POSTGRES_DB}" ]]; then
@@ -273,7 +273,7 @@ jobs:
             echo "Migración DB: habilitada (credenciales solo en env, no se imprimen)."
           else
             echo "db_migration_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Migración DB: omitida (faltan POSTGRES_HOST/USER/PASSWORD/DB en el secreto)."
+            echo "Migración DB: omitida (faltan host/usuario/contraseña/base en POSTGRES_*, host/username/… o DB_*)."
           fi
 
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
