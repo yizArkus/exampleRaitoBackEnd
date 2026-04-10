@@ -7,10 +7,12 @@
 #   Settings → Actions → Secrets (mismos nombres; valores enmascarados en logs)
 #
 #   AWS_ROLE_TO_ASSUME             ARN del rol IAM para GitHub OIDC
-#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto en AWS Secrets Manager (JSON abajo)
+#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto CI/CD en Secrets Manager (JSON abajo).
+#                                  Por defecto en el workflow: an-raito-cicd-dev (si no defines secret/var).
 #   AWS_REGION_DEFAULT             (opcional) Región del get-secret-value inicial, ej. us-east-1
-#   SKIP_ECS_SECRET_KEY_VALIDATION (opcional) Si es "true", no falla el job por valueFrom :KEY::
-#                                  (solo emergencia; la migración ECS seguirá fallando hasta corregir la TD en AWS)
+#   AWS_RDS_SECRET_ID, AWS_STORE_SECRET_ID (opcional) Nombres en Secrets Manager; por defecto
+#   an-raito-dev-rds-credentials-v1 y an-raito-dev-store-v1. El job registra la task definition con
+#   valueFrom ${ARN}:DB_HOST::, … y ALLOWED_ORIGINS <= CORS_ORIGINS (sin :KEY::).
 #
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
@@ -39,12 +41,6 @@ on:
         description: "Rama a desplegar (solo develop)"
         required: true
         default: "develop"
-      skip_ecs_secret_key_validation:
-        description: "Emergencia: omitir comprobación :KEY:: en la task definition (corregir AWS después)"
-        required: false
-        type: boolean
-        default: false
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -133,7 +129,8 @@ jobs:
       # Prioridad: Repository/Environment Secrets, luego Variables (mismo nombre).
       # Nota: muchos equipos guardan el ARN y el id del secreto en "Repository secrets"; si vars va primero en el ||, a veces el env queda vacío en el runner.
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
-      SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID }}
+      # Secreto con AWS_REGION, ECS_CLUSTER, ECR_REPOSITORY_NAME, etc. (dev: an-raito-cicd-dev)
+      SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID || 'an-raito-cicd-dev' }}
 
     steps:
       - name: Validate AWS role and Secrets Manager id
@@ -246,49 +243,6 @@ jobs:
 
           echo "Config cargada desde Secrets Manager (valores no mostrados)."
 
-      # Falla antes de build/push si la task definition aún tiene el placeholder :KEY:: en valueFrom
-      # (ResourceInitializationError / "did not contain json key KEY" en run-task de migración).
-      - name: Validate ECS task definition secrets (no JSON key placeholder KEY)
-        if: ${{ vars.SKIP_ECS_SECRET_KEY_VALIDATION != 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_ecs_secret_key_validation != true) }}
-        run: |
-          set -euo pipefail
-          TASK_DEF_ARN=$(aws ecs describe-services \
-            --cluster "${ECS_CLUSTER}" \
-            --services "${ECS_SERVICE}" \
-            --region "${AWS_REGION}" \
-            --query "services[0].taskDefinition" \
-            --output text)
-          if [[ -z "${TASK_DEF_ARN}" || "${TASK_DEF_ARN}" == "None" ]]; then
-            echo "::error::No se pudo resolver la task definition del servicio"
-            exit 1
-          fi
-          TASK_DEF_JSON=$(aws ecs describe-task-definition \
-            --task-definition "${TASK_DEF_ARN}" \
-            --region "${AWS_REGION}" \
-            --output json)
-          BAD_LINES=$(echo "${TASK_DEF_JSON}" | jq -r --arg cname "${ECS_CONTAINER_NAME}" '
-            .taskDefinition.containerDefinitions[]
-            | select(.name == $cname)
-            | .secrets[]?
-            | select(.valueFrom | test(":KEY::"))
-            | "\(.name) <= \(.valueFrom)"
-          ')
-          if [[ -n "${BAD_LINES}" ]]; then
-            echo "::error::valueFrom usa el placeholder :KEY:: (no es una clave válida en tu JSON o sobra si el secreto es texto plano)."
-            echo "  • Secreto JSON: cambia :KEY:: por una clave que exista (aws secretsmanager get-secret-value --secret-id <id> --query SecretString --output text | jq 'keys')."
-            echo "  • Secreto en texto plano: usa solo el ARN del secreto sin :KEY:: al final."
-            echo "  • CORS: env ALLOWED_ORIGINS con ...:CORS_ORIGINS:: si la clave en el JSON es CORS_ORIGINS."
-            echo "  Ver infra/ecs-secrets-mapping.md"
-            echo "${BAD_LINES}"
-            exit 1
-          fi
-          echo "OK: contenedor ${ECS_CONTAINER_NAME} sin :KEY:: en secrets."
-
-      - name: ECS secret KEY validation skipped (emergency)
-        if: ${{ vars.SKIP_ECS_SECRET_KEY_VALIDATION == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_ecs_secret_key_validation == true) }}
-        run: |
-          echo "::warning::Omitida la comprobación de :KEY:: en la task definition. La migración ECS puede fallar con ResourceInitializationError hasta que corrijas el valueFrom en AWS (quita :KEY:: o usa clave JSON real). Ver infra/ecs-secrets-mapping.md"
-
       - name: Ensure ECR repository exists
         run: |
           set -euo pipefail
@@ -330,12 +284,58 @@ jobs:
         id: register-task-def
         env:
           NEW_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:${{ steps.vars.outputs.short_sha }}
+          RDS_SECRET_ID: ${{ vars.AWS_RDS_SECRET_ID || 'an-raito-dev-rds-credentials-v1' }}
+          STORE_SECRET_ID: ${{ vars.AWS_STORE_SECRET_ID || 'an-raito-dev-store-v1' }}
         run: |
           set -euo pipefail
 
           echo "Contenedor ECS: ${ECS_CONTAINER_NAME}"
           echo "Puerto contenedor (ALB/TG): ${ECS_CONTAINER_PORT}"
           echo "Imagen nueva: ${NEW_IMAGE}"
+
+          if [[ -z "${RDS_SECRET_ID}" || -z "${STORE_SECRET_ID}" ]]; then
+            echo "::error::RDS_SECRET_ID y STORE_SECRET_ID deben estar definidos (vars AWS_RDS_SECRET_ID / AWS_STORE_SECRET_ID o valores por defecto en el workflow)."
+            exit 1
+          fi
+
+          RDS_SECRET_ARN=$(aws secretsmanager describe-secret \
+            --secret-id "${RDS_SECRET_ID}" \
+            --region "${AWS_REGION}" \
+            --query ARN \
+            --output text | tr -d '\r\n')
+          STORE_SECRET_ARN=$(aws secretsmanager describe-secret \
+            --secret-id "${STORE_SECRET_ID}" \
+            --region "${AWS_REGION}" \
+            --query ARN \
+            --output text | tr -d '\r\n')
+
+          if [[ -z "${RDS_SECRET_ARN}" || -z "${STORE_SECRET_ARN}" ]]; then
+            echo "::error::No se pudo resolver el ARN de Secrets Manager (describe-secret vacío)."
+            exit 1
+          fi
+
+          echo "Validando claves JSON en ${RDS_SECRET_ID} y ${STORE_SECRET_ID}..."
+          RDS_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "${RDS_SECRET_ID}" \
+            --region "${AWS_REGION}" \
+            --query SecretString \
+            --output text)
+          for k in DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD; do
+            if ! echo "${RDS_JSON}" | jq -e --arg k "$k" '(.[$k] != null) and ((.[$k] | tostring | length) > 0)' >/dev/null; then
+              echo "::error::El secreto RDS debe incluir una clave JSON no vacía: ${k}"
+              exit 1
+            fi
+          done
+
+          STORE_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "${STORE_SECRET_ID}" \
+            --region "${AWS_REGION}" \
+            --query SecretString \
+            --output text)
+          if ! echo "${STORE_JSON}" | jq -e '(.CORS_ORIGINS != null) and ((.CORS_ORIGINS | tostring | length) > 0)' >/dev/null; then
+            echo "::error::El secreto store debe incluir CORS_ORIGINS (no vacío) para mapear a ALLOWED_ORIGINS."
+            exit 1
+          fi
 
           TASK_DEF_ARN=$(aws ecs describe-services \
             --cluster "${ECS_CLUSTER}" \
@@ -355,8 +355,14 @@ jobs:
             --task-definition "${TASK_DEF_ARN}" \
             --region "${AWS_REGION}")
 
-          # Registro: quitar campos de solo lectura; imágenes por contenedor; opcionales nulos seguros
-          NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq --arg IMAGE "${NEW_IMAGE}" --arg CONTAINER "${ECS_CONTAINER_NAME}" --arg CPORT "${ECS_CONTAINER_PORT}" '
+          # Registro: imagen, PORT, y secrets con ARNs reales (sin :KEY::)
+          NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq \
+            --arg IMAGE "${NEW_IMAGE}" \
+            --arg CONTAINER "${ECS_CONTAINER_NAME}" \
+            --arg CPORT "${ECS_CONTAINER_PORT}" \
+            --arg RDS_ARN "${RDS_SECRET_ARN}" \
+            --arg STORE_ARN "${STORE_SECRET_ARN}" \
+            '
             .taskDefinition
             | del(
                 .taskDefinitionArn,
@@ -375,6 +381,14 @@ jobs:
                   | .environment = (
                       ((.environment // []) | map(select(.name != "PORT"))) + [{ "name": "PORT", "value": $CPORT }]
                     )
+                  | .secrets = [
+                      { "name": "DB_HOST",       "valueFrom": ($RDS_ARN + ":DB_HOST::") },
+                      { "name": "DB_PORT",       "valueFrom": ($RDS_ARN + ":DB_PORT::") },
+                      { "name": "DB_NAME",       "valueFrom": ($RDS_ARN + ":DB_NAME::") },
+                      { "name": "DB_USER",       "valueFrom": ($RDS_ARN + ":DB_USER::") },
+                      { "name": "DB_PASSWORD",   "valueFrom": ($RDS_ARN + ":DB_PASSWORD::") },
+                      { "name": "ALLOWED_ORIGINS", "valueFrom": ($STORE_ARN + ":CORS_ORIGINS::") }
+                    ]
                 else
                   .
                 end
@@ -406,6 +420,11 @@ jobs:
 
           echo "${NEW_TASK_DEF}" | jq empty
           echo "${NEW_TASK_DEF}" > task-def.json
+
+          if grep -q ':KEY::' task-def.json; then
+            echo "::error::Invalid secret mapping detected (:KEY::)"
+            exit 1
+          fi
 
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://task-def.json \
