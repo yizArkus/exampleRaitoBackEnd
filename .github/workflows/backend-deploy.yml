@@ -13,8 +13,11 @@
 # El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
 #   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
 # Opcional: ECS_CONTAINER_PORT (default 8080) — debe coincidir con el puerto del target group del ALB
-# Opcional (migración PostgreSQL / RDS): si están todas, el job ejecuta db/migrations/*.sql antes del deploy ECS
-#   POSTGRES_HOST, POSTGRES_PORT (default 5432), POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_SSLMODE (default require)
+# Opcional (migración PostgreSQL / RDS): el job ejecuta db/migrations/*.sql si hay credenciales completas.
+#   - En el secreto de deploy: POSTGRES_* explícitos, O
+#   - Secreto dedicado RDS_SECRETS_MANAGER_SECRET_ID (variable o secret GitHub), p. ej. an-raito-dev-rds-credentials-v1
+#     con JSON estilo AWS RDS: host, username, password, port, dbname (y/o POSTGRES_*; se fusionan).
+#   POSTGRES_SSLMODE default require
 # Estrategia migración: CI aquí = simple si el runner alcanza RDS (SG público, VPN o runner self-hosted en VPC).
 #   Si RDS es solo privado y GitHub-hosted no conecta, usa init/sidecar en ECS en la misma VPC o CodeBuild en VPC.
 
@@ -121,6 +124,8 @@ jobs:
       # Nota: muchos equipos guardan el ARN y el id del secreto en "Repository secrets"; si vars va primero en el ||, a veces el env queda vacío en el runner.
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME || vars.AWS_ROLE_TO_ASSUME }}
       SECRET_NAME: ${{ secrets.AWS_SECRETS_MANAGER_SECRET_ID || vars.AWS_SECRETS_MANAGER_SECRET_ID }}
+      # Opcional: segundo secreto en AWS solo para credenciales RDS (nombre o ARN)
+      RDS_SECRETS_MANAGER_SECRET_ID: ${{ secrets.RDS_SECRETS_MANAGER_SECRET_ID || vars.RDS_SECRETS_MANAGER_SECRET_ID }}
 
     steps:
       - name: Validate AWS role and Secrets Manager id
@@ -182,6 +187,7 @@ jobs:
         id: load-secret
         env:
           SECRET_ID: ${{ env.SECRET_NAME }}
+          RDS_SECRET_ID: ${{ env.RDS_SECRETS_MANAGER_SECRET_ID }}
         run: |
           set -euo pipefail
 
@@ -231,12 +237,27 @@ jobs:
             echo "ecs_container_name=${ECS_CONTAINER_NAME}"
           } >> "$GITHUB_OUTPUT"
 
-          POSTGRES_HOST=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_HOST // empty')
-          POSTGRES_PORT=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_PORT // "5432"')
-          POSTGRES_USER=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_USER // empty')
-          POSTGRES_PASSWORD=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_PASSWORD // empty')
-          POSTGRES_DB=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_DB // empty')
-          POSTGRES_SSLMODE=$(echo "${SECRET_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
+          MERGED_PG_JSON="${SECRET_JSON}"
+          if [[ -n "${RDS_SECRET_ID:-}" ]]; then
+            echo "Cargando credenciales RDS desde secreto adicional (nombre enmascarado en AWS)."
+            RDS_JSON=$(aws secretsmanager get-secret-value \
+              --secret-id "${RDS_SECRET_ID}" \
+              --region "${AWS_REGION_DEFAULT}" \
+              --query SecretString \
+              --output text)
+            MERGED_PG_JSON=$(jq -n \
+              --argjson main "$(echo "${SECRET_JSON}" | jq -c .)" \
+              --argjson rds "$(echo "${RDS_JSON}" | jq -c .)" \
+              '$main * $rds')
+          fi
+
+          # Acepta POSTGRES_* o claves típicas del secreto gestionado por RDS (host, username, password, dbname, port)
+          POSTGRES_HOST=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_HOST // .host // empty')
+          POSTGRES_PORT=$(echo "${MERGED_PG_JSON}" | jq -r '(.POSTGRES_PORT // .port // 5432) | tostring')
+          POSTGRES_USER=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_USER // .username // empty')
+          POSTGRES_PASSWORD=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_PASSWORD // .password // empty')
+          POSTGRES_DB=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_DB // .dbname // .database // empty')
+          POSTGRES_SSLMODE=$(echo "${MERGED_PG_JSON}" | jq -r '.POSTGRES_SSLMODE // "require"')
 
           if [[ -n "${POSTGRES_HOST}" && -n "${POSTGRES_USER}" && -n "${POSTGRES_PASSWORD}" && -n "${POSTGRES_DB}" ]]; then
             echo "::add-mask::${POSTGRES_PASSWORD}"
