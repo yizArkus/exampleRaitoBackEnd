@@ -5,16 +5,34 @@ import { errorHandler } from './middlewares/errorHandler';
 import { authRoutes } from './routes/authRoutes';
 import { apiRouter } from './routes';
 
+/** Set explícito: env + producción (Amplify / CloudFront front) por si el despliegue no trae env.ts actualizado. */
+function buildCorsAllowlist(): Set<string> {
+  return new Set<string>([
+    ...env.corsOrigins,
+    'https://main.dw9dd2io9vp1k.amplifyapp.com',
+    'https://dsjggq5txybwy.cloudfront.net',
+  ]);
+}
+
 export function createApp(): express.Application {
   const app = express();
+  const corsAllow = buildCorsAllowlist();
 
   app.use(
     cors({
       origin(origin, callback) {
-        if (origin === undefined || env.corsOrigins.includes(origin)) {
+        if (origin === undefined) {
           callback(null, true);
           return;
         }
+        const o = origin.trim();
+        if (corsAllow.has(o)) {
+          callback(null, true);
+          return;
+        }
+        // Sin esto el preflight devuelve 204 sin Access-Control-Allow-Origin (el navegador bloquea).
+        // eslint-disable-next-line no-console
+        console.warn('[cors] Origen no permitido:', o);
         callback(null, false);
       },
       credentials: true,
