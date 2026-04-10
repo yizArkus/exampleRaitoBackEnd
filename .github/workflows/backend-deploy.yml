@@ -441,22 +441,30 @@ jobs:
             --region "${AWS_REGION}" \
             --output json)
 
+          STOP_CODE=$(echo "${DESCRIBE_JSON}" | jq -r '.tasks[0].stopCode // empty')
+          STOP_REASON=$(echo "${DESCRIBE_JSON}" | jq -r '.tasks[0].stoppedReason // empty')
           EXIT_CODE=$(echo "${DESCRIBE_JSON}" | jq -r --arg cname "${ECS_CONTAINER_NAME}" \
             '[.tasks[0].containers[] | select(.name == $cname) | .exitCode] | first // empty')
 
           if [[ -z "${EXIT_CODE}" || "${EXIT_CODE}" == "null" ]]; then
-            echo "::group::describe-tasks (sin exitCode)"
-            echo "${DESCRIBE_JSON}" | jq '.tasks[0]'
+            echo "::group::describe-tasks (no container exitCode — task may have failed before start)"
+            echo "${DESCRIBE_JSON}" | jq '.tasks[0] | {stopCode, stoppedReason, containers}'
             echo "::endgroup::"
-            echo "::error::No se obtuvo exitCode del contenedor ${ECS_CONTAINER_NAME}"
+            if [[ "${STOP_REASON}" == *"did not contain json key"* ]]; then
+              echo "::error::ECS task definition references a JSON key in Secrets Manager that is missing from the secret. Edit the task definition: each secret \"key\" must match a property in the secret JSON (e.g. DB_HOST, DB_PASSWORD). Placeholder names like KEY will fail."
+            elif [[ "${STOP_CODE}" == "TaskFailedToStart" ]]; then
+              echo "::error::TaskFailedToStart: ${STOP_REASON}"
+            else
+              echo "::error::No exitCode for container ${ECS_CONTAINER_NAME}. stopCode=${STOP_CODE}"
+            fi
             exit 1
           fi
 
           if [[ "${EXIT_CODE}" != "0" ]]; then
-            echo "::group::Tarea de migración fallida"
+            echo "::group::Migration task failed (non-zero exit)"
             echo "${DESCRIBE_JSON}" | jq '.tasks[0] | {stoppedReason: .stoppedReason, stopCode: .stopCode, containers: .containers}'
             echo "::endgroup::"
-            echo "::error::Migración falló con exit code ${EXIT_CODE}"
+            echo "::error::Migration exited with code ${EXIT_CODE}"
             exit 1
           fi
 
