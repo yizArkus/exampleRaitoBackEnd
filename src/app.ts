@@ -19,7 +19,8 @@ export function createApp(): express.Application {
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      // Lista no restringida: el middleware refleja Access-Control-Request-Headers en preflight.
+      optionsSuccessStatus: 204,
     })
   );
 

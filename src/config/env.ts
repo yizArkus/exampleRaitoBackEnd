@@ -10,14 +10,17 @@ const DEFAULT_CORS_ORIGINS = [
   'https://main.dw9dd2io9vp1k.amplifyapp.com',
 ] as const;
 
+/** Une defaults con CORS_ORIGINS para que un valor en ECS (p. ej. solo el API) no quite Amplify. */
 function parseCorsOrigins(raw: string | undefined): string[] {
+  const defaults = [...DEFAULT_CORS_ORIGINS];
   if (raw === undefined || raw.trim() === '') {
-    return [...DEFAULT_CORS_ORIGINS];
+    return defaults;
   }
-  return raw
+  const extra = raw
     .split(',')
     .map(s => s.trim())
     .filter(s => s.length > 0);
+  return [...new Set([...defaults, ...extra])];
 }
 
 const defaultJwtSecret = 'dev-only-change-me-use-strong-secret-in-production';
