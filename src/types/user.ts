@@ -1,7 +1,7 @@
 export interface UserRecord {
   id: string;
   email: string;
-  /** Hash bcrypt; nunca exponer en respuestas HTTP. */
+  /** bcrypt hash; never expose in HTTP responses. */
   passwordHash: string;
 }
 

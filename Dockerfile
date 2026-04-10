@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
-# Build context: raíz del repositorio (donde están package.json y src/).
+# Build context: repository root (package.json and src/).
 
 FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-# Sin scripts: "prepare"/husky no aplica en imagen Docker (evita exit 127).
+# Omit lifecycle scripts (prepare/husky) in the image build.
 RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
@@ -20,7 +20,7 @@ FROM node:20-bookworm-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
-# Mismo puerto que el target group del ALB (p. ej. 8080); PORT lo puede sobreescribir ECS.
+# Must match ALB target group port (e.g. 8080); ECS can override PORT.
 ENV PORT=8080
 
 RUN groupadd --system --gid 1001 nodejs \

@@ -19,7 +19,7 @@ export async function login(req: Request, res: Response, next: NextFunction): Pr
       throw new AppError(
         400,
         'VALIDATION_ERROR',
-        'Se requieren los campos email y password como texto.'
+        'Fields "email" and "password" are required as strings.'
       );
     }
 

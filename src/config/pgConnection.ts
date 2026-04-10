@@ -1,6 +1,6 @@
 /**
- * Configuración compartida para `pg` (Pool en la app, Client en migraciones).
- * Variables: DATABASE_URL o DB_* / POSTGRES_* (Secrets Manager en ECS).
+ * Shared PostgreSQL client config for the app pool and migration script.
+ * Use DATABASE_URL or DB_* / POSTGRES_* (e.g. from AWS Secrets Manager in ECS).
  */
 import type { ClientConfig } from 'pg';
 
@@ -65,7 +65,7 @@ export function buildPgConfig(): ClientConfig {
 
   if (!host || !user || password === undefined || !database) {
     throw new Error(
-      'Faltan credenciales de BD: define DATABASE_URL o POSTGRES_* / DB_* (host, user, password, database).'
+      'Missing database configuration: set DATABASE_URL or POSTGRES_* / DB_* (host, user, password, database).'
     );
   }
 

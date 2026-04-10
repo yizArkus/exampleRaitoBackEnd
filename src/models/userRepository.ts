@@ -2,8 +2,7 @@ import { getPool } from '../db/pool';
 import type { UserRecord } from '../types/user';
 
 /**
- * Busca usuario por email en PostgreSQL (tabla `users` de la migración).
- * Esquema: columna `email`, no `username`.
+ * Loads a user by email from PostgreSQL (`users` table).
  */
 export async function findUserByEmail(email: string): Promise<UserRecord | null> {
   const pool = getPool();

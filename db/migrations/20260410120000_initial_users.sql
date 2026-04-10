@@ -1,5 +1,5 @@
--- Migración idempotente: esquema mínimo de usuarios.
--- Usuario inicial: src/scripts/run-migrations.ts (ygonzalez@arkusnexus.com, bcrypt; default admin123 o BOOTSTRAP_ADMIN_PASSWORD).
+-- Idempotent schema: minimal users table.
+-- Bootstrap user: see src/scripts/run-migrations.ts (bcrypt hash; env BOOTSTRAP_ADMIN_*).
 
 CREATE TABLE IF NOT EXISTS users (
   id              BIGSERIAL PRIMARY KEY,

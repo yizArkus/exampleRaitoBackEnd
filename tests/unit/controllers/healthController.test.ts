@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import { getHealth } from '../../../src/controllers/healthController';
 
 describe('getHealth', () => {
-  it('responde 200 con cuerpo esperado', () => {
+  it('returns 200 with standard success envelope', () => {
     const req = {} as Request;
     const json = jest.fn();
     const status = jest.fn().mockReturnValue({ json });
@@ -13,8 +13,11 @@ describe('getHealth', () => {
     expect(status).toHaveBeenCalledWith(200);
     expect(json).toHaveBeenCalledWith(
       expect.objectContaining({
-        status: 'ok',
-        service: 'rait-backend',
+        success: true,
+        data: expect.objectContaining({
+          status: 'ok',
+          service: 'rait-backend',
+        }),
       })
     );
   });

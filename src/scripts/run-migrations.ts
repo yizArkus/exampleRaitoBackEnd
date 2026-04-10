@@ -1,10 +1,10 @@
 /**
- * Ejecutado en ECS Run Task (misma task definition que el servicio, command override).
- * Usa las mismas variables / secretos que el contenedor de la app (RDS en VPC).
+ * Run as an ECS one-off task (same task definition as the service, command override).
+ * Uses the same env / secrets as the app container (RDS inside the VPC).
  *
- * - Bloqueo advisory en PostgreSQL para evitar migraciones concurrentes (varias réplicas / pipelines).
- * - DDL idempotente desde db/migrations/*.sql
- * - Usuario bootstrap idempotente: ygonzalez@arkusnexus.com / admin123 por defecto (sobrescribible con env).
+ * - Transaction-scoped advisory lock to avoid concurrent migrations.
+ * - Idempotent DDL from db/migrations/*.sql
+ * - Optional bootstrap admin (bcrypt); override via BOOTSTRAP_ADMIN_* env vars.
  */
 
 import bcrypt from 'bcrypt';
@@ -13,14 +13,12 @@ import * as path from 'path';
 import { Client } from 'pg';
 import { buildPgConfig, optionalEnv } from '../config/pgConnection';
 
-/** Constantes de lock estables entre ejecuciones (no usar random). */
-const ADVISORY_KEY_1 = 0x72616974; // 'rait'
-const ADVISORY_KEY_2 = 0x6d696772; // 'migr'
+const ADVISORY_KEY_1 = 0x72616974;
+const ADVISORY_KEY_2 = 0x6d696772;
 
 const DDL_RELATIVE = '../../db/migrations/20260410120000_initial_users.sql';
 
 const DEFAULT_BOOTSTRAP_EMAIL = 'ygonzalez@arkusnexus.com';
-/** Solo desarrollo / bootstrap; en producción define BOOTSTRAP_ADMIN_PASSWORD en Secrets Manager. */
 const DEFAULT_BOOTSTRAP_PASSWORD = 'admin123';
 
 function logFailure(err: unknown): void {
@@ -28,7 +26,7 @@ function logFailure(err: unknown): void {
     const o = err as { message?: string; code?: string; detail?: string; severity?: string };
     // eslint-disable-next-line no-console
     console.error(
-      '[migrate] PostgreSQL / error:',
+      '[migrate] PostgreSQL error:',
       JSON.stringify({
         message: o.message,
         code: o.code,
@@ -48,7 +46,7 @@ async function run(): Promise<void> {
 
   const ddlPath = path.join(__dirname, DDL_RELATIVE);
   if (!fs.existsSync(ddlPath)) {
-    throw new Error(`No se encontró el archivo de migración: ${ddlPath}`);
+    throw new Error(`Migration file not found: ${ddlPath}`);
   }
   const ddl = fs.readFileSync(ddlPath, 'utf8');
 
@@ -71,7 +69,7 @@ async function run(): Promise<void> {
       [email, passwordHash]
     );
     // eslint-disable-next-line no-console
-    console.log('[migrate] Usuario bootstrap comprobado/creado (email idempotente).');
+    console.log('[migrate] Bootstrap admin ensured (idempotent by email).');
 
     await client.query('COMMIT');
   } catch (e) {

@@ -5,7 +5,7 @@ export function errorHandler(
   err: unknown,
   _req: Request,
   res: Response,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- firma de error middleware de Express (4 args)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Express error middleware signature
   _next: NextFunction
 ): void {
   if (err instanceof AppError) {
@@ -19,13 +19,13 @@ export function errorHandler(
     return;
   }
 
-  // eslint-disable-next-line no-console -- registro mínimo de fallos no controlados
+  // eslint-disable-next-line no-console
   console.error(err);
   res.status(500).json({
     success: false,
     error: {
       code: 'INTERNAL_ERROR',
-      message: 'Error interno del servidor.',
+      message: 'An unexpected error occurred.',
     },
   });
 }

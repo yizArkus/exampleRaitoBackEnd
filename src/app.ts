@@ -1,20 +1,27 @@
 import cors from 'cors';
 import express from 'express';
+import { env } from './config/env';
 import { errorHandler } from './middlewares/errorHandler';
-import { authRoutes } from './routes/authRoutes';
 import { apiRouter } from './routes';
-
-/** Único origen permitido (AWS Amplify). */
-export const CORS_ORIGIN_AMPLIFY = 'https://main.dw9dd2io9vp1k.amplifyapp.com';
 
 export function createApp(): express.Application {
   const app = express();
 
-  // Debe ir antes de cualquier ruta (incl. /auth, /api).
   app.use(
     cors({
-      origin: CORS_ORIGIN_AMPLIFY,
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      origin(origin, callback) {
+        if (origin === undefined) {
+          callback(null, true);
+          return;
+        }
+        if (env.allowedOrigins.includes(origin)) {
+          callback(null, true);
+          return;
+        }
+        callback(null, false);
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: [
         'Content-Type',
         'Authorization',
@@ -22,16 +29,11 @@ export function createApp(): express.Application {
         'X-Api-Key',
         'X-Amz-Security-Token',
       ],
-      credentials: true,
       optionsSuccessStatus: 204,
     })
   );
 
   app.use(express.json());
-
-  /** Auth también en /auth/* (además de /api/auth/*) para clientes que usen URL sin prefijo /api. */
-  app.use('/auth', authRoutes);
-
   app.use('/api', apiRouter);
 
   app.use((_req, res) => {
@@ -39,7 +41,7 @@ export function createApp(): express.Application {
       success: false,
       error: {
         code: 'NOT_FOUND',
-        message: 'Recurso no encontrado.',
+        message: 'Resource not found.',
       },
     });
   });

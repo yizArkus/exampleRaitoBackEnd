@@ -13,7 +13,7 @@ describe('login', () => {
     jest.clearAllMocks();
   });
 
-  it('responde 200 cuando loginWithCredentials tiene éxito', async () => {
+  it('returns 200 when loginWithCredentials succeeds', async () => {
     const payload = {
       token: 'jwt',
       user: { id: 'u1', email: 'user@example.com' },
@@ -33,7 +33,7 @@ describe('login', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('delega en next cuando email o password no son string', async () => {
+  it('calls next when email or password are not strings', async () => {
     const req = { body: { email: 123, password: 'x' } } as unknown as Request;
     const res = { status: jest.fn(), json: jest.fn() } as unknown as Response;
 
