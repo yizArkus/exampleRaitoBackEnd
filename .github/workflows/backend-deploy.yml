@@ -1,5 +1,13 @@
-# CI/CD: lint, typecheck, tests + imagen Docker → ECR → ECS (force new deployment)
-# Requiere secrets de AWS/ECR/ECS configurados en el repositorio.
+# CI: lint, typecheck, tests + cobertura
+# CD (solo develop): OIDC → Secrets Manager → buildx (GHA cache) → ECR → nueva task definition → ECS
+#
+# Variables de repositorio (Settings → Variables):
+#   AWS_ROLE_TO_ASSUME          ARN del rol IAM para GitHub OIDC
+#   AWS_SECRETS_MANAGER_SECRET_ID  Nombre o ARN del secreto en Secrets Manager (JSON con claves abajo)
+#   AWS_REGION_DEFAULT          Región donde está el secreto (y sesión inicial AWS CLI), ej. us-east-1
+#
+# El JSON en Secrets Manager debe incluir (sin hardcodear en el workflow):
+#   AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY_NAME, ECS_CLUSTER, ECS_SERVICE, ECS_CONTAINER_NAME
 
 name: Backend CI/CD
 
@@ -8,6 +16,12 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Rama a desplegar (solo develop)"
+        required: true
+        default: "develop"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,6 +32,10 @@ permissions:
 
 env:
   NODE_VERSION: "20"
+  DOCKERFILE_PATH: ./Dockerfile
+  # Valores por defecto; sobreescribibles con variables de repositorio
+  AWS_REGION_DEFAULT: ${{ vars.AWS_REGION_DEFAULT || 'us-east-1' }}
+  SECRET_NAME: ${{ vars.AWS_SECRETS_MANAGER_SECRET_ID }}
 
 jobs:
   ci:
@@ -71,97 +89,282 @@ jobs:
             exit 1
           fi
 
-  deploy:
-    name: CD (Docker → ECR → ECS)
+  deploy-develop:
+    name: CD Develop (OIDC → ECR → ECS)
     needs: ci
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.branch == 'develop')
     runs-on: ubuntu-latest
+    environment: development
     defaults:
       run:
         shell: bash
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    permissions:
+      contents: read
+      id-token: write
 
-      - name: Validate required secrets
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
-          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
-          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+    env:
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+
+    steps:
+      - name: Validate required repository variables
         run: |
           set -euo pipefail
           missing=()
-          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY ECR_REPOSITORY_URI ECS_CLUSTER ECS_SERVICE; do
-            if [[ -z "${!var:-}" ]]; then
-              missing+=("$var")
-            fi
-          done
-          if [[ ${#missing[@]} -ne 0 ]]; then
-            echo "::error::Faltan secrets en el repositorio: ${missing[*]}"
+          [[ -z "${AWS_ROLE_TO_ASSUME:-}" ]] && missing+=("AWS_ROLE_TO_ASSUME")
+          [[ -z "${SECRET_NAME:-}" ]] && missing+=("AWS_SECRETS_MANAGER_SECRET_ID")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Faltan variables de repositorio: ${missing[*]}"
             exit 1
           fi
-          echo "Secrets requeridos presentes (valores no mostrados)."
 
-      - name: Resolve AWS region from ECR repository URI
-        id: ecr_meta
-        env:
-          URI: ${{ secrets.ECR_REPOSITORY_URI }}
+      - name: Validate manual dispatch branch
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          if [[ ! "${URI}" =~ ^[0-9]+\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com/.+ ]]; then
-            echo "::error::ECR_REPOSITORY_URI con formato inesperado."
-            echo "Esperado: <account>.dkr.ecr.<region>.amazonaws.com/<nombre-repo>"
+          if [[ "${{ github.event.inputs.branch }}" != "develop" ]]; then
+            echo "::error::Solo se permite desplegar manualmente la rama develop"
             exit 1
           fi
-          REGION="${BASH_REMATCH[1]}"
-          echo "region=${REGION}" >> "${GITHUB_OUTPUT}"
-          echo "Región resuelta desde ECR: ${REGION}"
 
-      - name: Configure AWS credentials
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref }}
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract short SHA and sanitized branch name
+        id: vars
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            REF_NAME="${{ github.event.inputs.branch }}"
+          else
+            REF_NAME="${GITHUB_REF_NAME}"
+          fi
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$(echo "${REF_NAME}" | sed 's/[^a-zA-Z0-9._-]/-/g')" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ steps.ecr_meta.outputs.region }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION_DEFAULT }}
+          audience: sts.amazonaws.com
+
+      - name: Load deploy config from AWS Secrets Manager
+        id: load-secret
+        env:
+          SECRET_ID: ${{ env.SECRET_NAME }}
+        run: |
+          set -euo pipefail
+
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "${SECRET_ID}" \
+            --region "${AWS_REGION_DEFAULT}" \
+            --query SecretString \
+            --output text)
+
+          read_secret() {
+            local key="$1"
+            local val
+            val=$(echo "${SECRET_JSON}" | jq -r --arg k "$key" '.[$k] // empty')
+            if [[ -z "${val}" || "${val}" == "null" ]]; then
+              echo "::error::Clave obligatoria ausente o nula en el secreto: ${key}"
+              exit 1
+            fi
+            printf '%s' "${val}"
+          }
+
+          AWS_REGION=$(read_secret AWS_REGION)
+          AWS_ACCOUNT_ID=$(read_secret AWS_ACCOUNT_ID)
+          ECR_REPOSITORY_NAME=$(read_secret ECR_REPOSITORY_NAME)
+          ECS_CLUSTER=$(read_secret ECS_CLUSTER)
+          ECS_SERVICE=$(read_secret ECS_SERVICE)
+          ECS_CONTAINER_NAME=$(read_secret ECS_CONTAINER_NAME)
+
+          {
+            echo "AWS_REGION=${AWS_REGION}"
+            echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}"
+            echo "ECR_REPOSITORY_NAME=${ECR_REPOSITORY_NAME}"
+            echo "ECS_CLUSTER=${ECS_CLUSTER}"
+            echo "ECS_SERVICE=${ECS_SERVICE}"
+            echo "ECS_CONTAINER_NAME=${ECS_CONTAINER_NAME}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "ecr_repository_name=${ECR_REPOSITORY_NAME}"
+            echo "ecs_cluster=${ECS_CLUSTER}"
+            echo "ecs_service=${ECS_SERVICE}"
+            echo "ecs_container_name=${ECS_CONTAINER_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Config cargada desde Secrets Manager (valores no mostrados)."
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "${ECR_REPOSITORY_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "Creando repositorio ECR: ${ECR_REPOSITORY_NAME}"
+            aws ecr create-repository --repository-name "${ECR_REPOSITORY_NAME}" --region "${AWS_REGION}" --no-cli-pager
+          fi
 
       - name: Login to Amazon ECR
-        id: ecr_login
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
 
-      - name: Build, tag and push image
-        id: image
-        env:
-          ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Build and push image (buildx + GHA cache)
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:${{ steps.vars.outputs.short_sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:${{ steps.vars.outputs.branch_name }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Export image URI for summary
+        id: image-meta
         run: |
           set -euo pipefail
-          echo "Building image ${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
-          docker build -t "${ECR_REPOSITORY_URI}:${IMAGE_TAG}" .
-          docker tag "${ECR_REPOSITORY_URI}:${IMAGE_TAG}" "${ECR_REPOSITORY_URI}:latest"
-          echo "Pushing tags: ${IMAGE_TAG}, latest"
-          docker push "${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
-          docker push "${ECR_REPOSITORY_URI}:latest"
-          {
-            echo "repository_uri=${ECR_REPOSITORY_URI}"
-            echo "tag_sha=${IMAGE_TAG}"
-          } >> "${GITHUB_OUTPUT}"
-          echo "Imagen publicada correctamente."
+          URI="${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:${{ steps.vars.outputs.short_sha }}"
+          echo "image_uri=${URI}" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to Amazon ECS
+      - name: Register new ECS task definition revision
+        id: register-task-def
         env:
-          AWS_REGION: ${{ steps.ecr_meta.outputs.region }}
-          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
-          ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+          NEW_IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ steps.load-secret.outputs.ecr_repository_name }}:${{ steps.vars.outputs.short_sha }}
         run: |
           set -euo pipefail
-          echo "Forzando nuevo despliegue en cluster=${ECS_CLUSTER} service=${ECS_SERVICE} region=${AWS_REGION}"
+
+          echo "Contenedor ECS: ${ECS_CONTAINER_NAME}"
+          echo "Imagen nueva: ${NEW_IMAGE}"
+
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}" \
+            --query "services[0].taskDefinition" \
+            --output text)
+
+          if [[ -z "${TASK_DEF_ARN}" || "${TASK_DEF_ARN}" == "None" ]]; then
+            echo "::error::No se pudo resolver la task definition del servicio"
+            exit 1
+          fi
+
+          echo "Task definition actual: ${TASK_DEF_ARN}"
+
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_DEF_ARN}" \
+            --region "${AWS_REGION}")
+
+          # Registro: quitar campos de solo lectura; imágenes por contenedor; opcionales nulos seguros
+          NEW_TASK_DEF=$(echo "${TASK_DEF_JSON}" | jq --arg IMAGE "${NEW_IMAGE}" --arg CONTAINER "${ECS_CONTAINER_NAME}" '
+            .taskDefinition
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy,
+                .deregisteredAt
+              )
+            | .containerDefinitions |= map(
+                if .name == $CONTAINER then .image = $IMAGE else . end
+              )
+            | .volumes = (.volumes // [])
+            | .placementConstraints = (.placementConstraints // [])
+            | {
+                family: .family,
+                executionRoleArn: .executionRoleArn,
+                containerDefinitions: .containerDefinitions,
+                requiresCompatibilities: .requiresCompatibilities,
+                cpu: .cpu,
+                memory: .memory,
+                volumes: .volumes,
+                placementConstraints: .placementConstraints
+              }
+              + (if (.networkMode // null) != null and (.networkMode | tostring | length) > 0
+                 then { networkMode: .networkMode } else {} end)
+              + (if (.taskRoleArn // null) != null and (.taskRoleArn | tostring | length) > 0
+                 then { taskRoleArn: .taskRoleArn } else {} end)
+              + (if (.runtimePlatform // null) != null then { runtimePlatform: .runtimePlatform } else {} end)
+              + (if (.ephemeralStorage // null) != null then { ephemeralStorage: .ephemeralStorage } else {} end)
+              + (if (.pidMode // null) != null then { pidMode: .pidMode } else {} end)
+              + (if (.ipcMode // null) != null then { ipcMode: .ipcMode } else {} end)
+              + (if (.proxyConfiguration // null) != null then { proxyConfiguration: .proxyConfiguration } else {} end)
+              + (if (.inferenceAccelerators // null) != null and (.inferenceAccelerators | length) > 0
+                 then { inferenceAccelerators: .inferenceAccelerators } else {} end)
+          ')
+
+          echo "${NEW_TASK_DEF}" | jq empty
+          echo "${NEW_TASK_DEF}" > task-def.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def.json \
+            --region "${AWS_REGION}" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text \
+            --no-cli-pager)
+
+          echo "task_def_arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Nueva task definition: ${NEW_TASK_DEF_ARN}"
+
+      - name: Update ECS service
+        run: |
+          set -euo pipefail
           aws ecs update-service \
             --cluster "${ECS_CLUSTER}" \
             --service "${ECS_SERVICE}" \
+            --task-definition "${{ steps.register-task-def.outputs.task_def_arn }}" \
             --force-new-deployment \
             --region "${AWS_REGION}" \
             --no-cli-pager
-          echo "ECS update-service solicitado. Revisa el despliegue en la consola de AWS."
+
+      - name: Deployment summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Despliegue Develop — ECR & ECS"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|--------|--------|"
+            echo "| Rama / ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Commit (corto) | \`${{ steps.vars.outputs.short_sha }}\` |"
+            echo "| Tag rama | \`${{ steps.vars.outputs.branch_name }}\` |"
+            echo "| Imagen (commit) | \`${{ steps.image-meta.outputs.image_uri }}\` |"
+            echo "| Cluster | \`${ECS_CLUSTER}\` |"
+            echo "| Servicio | \`${ECS_SERVICE}\` |"
+            echo "| Contenedor actualizado | \`${ECS_CONTAINER_NAME}\` |"
+            echo "| Task definition | \`${{ steps.register-task-def.outputs.task_def_arn }}\` |"
+            echo "| Región | \`${AWS_REGION}\` |"
+            echo "| Cuenta | \`${AWS_ACCOUNT_ID}\` |"
+            echo "| Repositorio ECR | \`${ECR_REPOSITORY_NAME}\` |"
+            echo ""
+            echo "### OIDC"
+            echo "Rol asumido: \`${AWS_ROLE_TO_ASSUME}\`"
+            echo ""
+            echo "### Notas"
+            echo "- Imagen etiquetada: \`${{ steps.vars.outputs.short_sha }}\`, \`${{ steps.vars.outputs.branch_name }}\`, \`latest\`."
+            echo "- Se registró una **nueva revisión** de task definition y se aplicó \`force-new-deployment\`."
+          } >> "$GITHUB_STEP_SUMMARY"
