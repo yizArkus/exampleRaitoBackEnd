@@ -6,6 +6,8 @@ const DEFAULT_CORS_ORIGINS = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://dsjggq5txybwy.cloudfront.net',
+  /** Front en AWS Amplify (Origin del navegador en preflight CORS). */
+  'https://main.dw9dd2io9vp1k.amplifyapp.com',
 ] as const;
 
 function parseCorsOrigins(raw: string | undefined): string[] {
@@ -25,6 +27,6 @@ export const env = {
   port: Number(process.env.PORT ?? 3000),
   jwtSecret: process.env.JWT_SECRET ?? defaultJwtSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '8h',
-  /** Orígenes permitidos para el front (CORS). Si CORS_ORIGINS está vacío: localhost + CloudFront dev. Si lo defines, incluye ahí los orígenes (p. ej. el mismo CloudFront). */
+  /** CORS: debe incluir el origen del front (p. ej. Amplify), no solo la URL del API. Si CORS_ORIGINS está vacío se usan los default. */
   corsOrigins: parseCorsOrigins(process.env.CORS_ORIGINS),
 } as const;
