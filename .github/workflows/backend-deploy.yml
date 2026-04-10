@@ -367,6 +367,9 @@ jobs:
           echo "task_def_arn=${NEW_TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
           echo "Nueva task definition: ${NEW_TASK_DEF_ARN}"
 
+      # Migration uses the same task definition as the service. If run-task fails with
+      # "did not contain json key", fix ECS task definition Secrets: each valueFrom JSON key
+      # must exist in the Secrets Manager secret JSON (see infra/ecs-secrets-valueFrom-format.txt).
       - name: Run database migrations (ECS one-off task)
         id: ecs-migrate
         env:

@@ -1,6 +1,6 @@
 import cors from 'cors';
 import express from 'express';
-import { env } from './config/env';
+import { env, normalizeOrigin } from './config/env';
 import { errorHandler } from './middlewares/errorHandler';
 import { apiRouter } from './routes';
 
@@ -14,7 +14,7 @@ export function createApp(): express.Application {
           callback(null, true);
           return;
         }
-        if (env.allowedOrigins.includes(origin)) {
+        if (env.allowedOrigins.includes(normalizeOrigin(origin))) {
           callback(null, true);
           return;
         }
